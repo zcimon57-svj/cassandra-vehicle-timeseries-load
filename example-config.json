@@ -24,9 +24,12 @@
     "table": "vehicle_timeseries",
     "temperature_source": "write_timestamp",
     "temperature_column": "",
+    "partition_key_columns": [
+      "vehicle_id"
+    ],
     "create_keyspace_if_missing": true,
     "create_table_if_missing": true,
-    "keyspace_cql": "CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    "keyspace_cql": "CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '3'}",
     "table_cql": "CREATE TABLE IF NOT EXISTS {keyspace}.{table} (vehicle_id text, event_time_s bigint, timeline text, sample_seq bigint, time_window text, speed_kph double, engine_rpm int, coolant_temp_c double, battery_voltage double, fuel_percent double, latitude double, longitude double, heading_deg double, odometer_km double, status text, payload blob, PRIMARY KEY (vehicle_id, event_time_s, timeline, sample_seq)) WITH CLUSTERING ORDER BY (event_time_s ASC, timeline ASC, sample_seq ASC) AND Z06_CHS = {'chs_time':'3600','time_unit':'s'}",
     "truncate_before_load": false,
     "columns": [
@@ -126,12 +129,16 @@
       {
         "name": "payload",
         "generator": "random_blob",
-        "size": 256
+        "size": 256,
+        "pool_size": 256
       }
     ]
   },
   "workload": {
-    "concurrency": 32,
+    "write_mode": "async",
+    "concurrency": 256,
+    "producer_threads": 8,
+    "batch_size": 8,
     "total_rows": 100000,
     "duration_seconds": 0,
     "rate_limit_rows_per_second": 0,
