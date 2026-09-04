@@ -242,6 +242,33 @@ ps -fp "$(cat vehicle-load.pid)"
 `FAIL:` 并返回非零退出码。`python -u` 与脚本的显式 flush 可以确保重定向日志及时
 可见。
 
+### 4.1 低吞吐快速判断
+
+当 in-flight 长期打满时，可用下面的近似判断请求延迟是否已经锁住吞吐：
+
+```text
+平均请求延迟（秒）≈ inflight_req / req_rate
+```
+
+例如 640 个请求、约 2050 req/s，对应平均约 312 ms；这时继续增加 concurrency 通常
+只会加深排队。应优先比较同等 `inflight_rows` 下的 batch、sessions，再检查：
+
+```bash
+nodetool status
+nodetool tpstats
+nodetool compactionstats
+nodetool proxyhistograms
+iostat -x 1
+```
+
+- `coordinators` 明显只集中在一个地址：检查三个 contact points、`local_dc`、token-aware
+  路由和节点状态；
+- `client_cpu` 接近单进程上限而服务端空闲：增加压测进程，不要继续增加单进程线程；
+- coordinator 分布均匀、客户端 CPU 不高、服务端 CPU 也低但 P95 很高：重点检查
+  commitlog fsync、磁盘 await/util、RocksDB write stall、pending compaction、GC 和网络；
+- batch 后 req/s 相近但 rows/s 按 batch 倍数增长：瓶颈主要是单请求往返；
+- batch 后请求延迟或服务端 pending 急剧上升：缩小 batch 或 concurrency。
+
 ## 5. 温度来源与业务时间构造
 
 这两个概念必须分开：
