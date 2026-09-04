@@ -6,6 +6,7 @@
     "port": 9042,
     "local_dc": "",
     "cassandra_home": "",
+    "sessions": 1,
     "username_env": "",
     "password_env": "",
     "connect_timeout_seconds": 10,
@@ -135,8 +136,8 @@
     ]
   },
   "workload": {
-    "write_mode": "async",
-    "concurrency": 256,
+    "write_mode": "unlogged_batch",
+    "concurrency": 80,
     "producer_threads": 8,
     "batch_size": 8,
     "total_rows": 100000,

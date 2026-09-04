@@ -25,6 +25,11 @@ import time
 from collections import deque
 from datetime import date, datetime, timedelta, tzinfo
 
+try:
+    import queue as queue_module
+except ImportError:
+    import Queue as queue_module
+
 PY2 = sys.version_info[0] == 2
 try:
     STRING_TYPES = (basestring,)  # noqa: F821 - defined by Python 2.
@@ -81,6 +86,11 @@ def _datetime_to_epoch(value):
 
 def _epoch_to_datetime(value):
     return datetime.utcfromtimestamp(value).replace(tzinfo=UTC_TZ)
+
+
+def _process_cpu_seconds():
+    process_times = os.times()
+    return process_times[0] + process_times[1]
 
 
 def _fullmatch(pattern, value, flags=0):
@@ -311,6 +321,7 @@ def validate_config(raw_config):
             "port",
             "local_dc",
             "cassandra_home",
+            "sessions",
             "username_env",
             "password_env",
             "connect_timeout_seconds",
@@ -336,6 +347,11 @@ def validate_config(raw_config):
         "connection.cassandra_home",
         allow_empty=True,
     )
+    sessions = _require_int(
+        connection.setdefault("sessions", 1), "connection.sessions", 1
+    )
+    if sessions > 16:
+        raise ConfigError("connection.sessions must be <= 16")
     _require_string(
         connection.setdefault("username_env", ""),
         "connection.username_env",
@@ -832,6 +848,8 @@ def apply_overrides(config, args):
     workload = result["workload"]
     if getattr(args, "cassandra_home", None) is not None:
         result["connection"]["cassandra_home"] = args.cassandra_home
+    if args.sessions is not None:
+        result["connection"]["sessions"] = args.sessions
     if args.write_mode is not None:
         workload["write_mode"] = args.write_mode
     if args.concurrency is not None:
@@ -1134,6 +1152,7 @@ class LoadController:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.started_at = MONOTONIC_TIME()
+        self.started_cpu_seconds = _process_cpu_seconds()
         self.next_index = 0
         self.in_flight = 0
         self.succeeded = 0
@@ -1141,6 +1160,7 @@ class LoadController:
         self.request_attempts = 0
         self.request_errors = 0
         self.requests_in_flight = 0
+        self.coordinator_requests = {}
         self.latency_seen = 0
         self.latency_samples = []
         self.latency_rng = random.Random(workload["random_seed"] ^ 0xC0FFEE)
@@ -1208,12 +1228,16 @@ class LoadController:
         with self.lock:
             self.requests_in_flight += 1
 
-    def record_request(self, latency_ms, failed):
+    def record_request(self, latency_ms, failed, coordinator=None):
         with self.lock:
             self.requests_in_flight -= 1
             self.request_attempts += 1
             if failed:
                 self.request_errors += 1
+            if coordinator:
+                self.coordinator_requests[coordinator] = (
+                    self.coordinator_requests.get(coordinator, 0) + 1
+                )
             self.latency_seen += 1
             if len(self.latency_samples) < self.max_latency_samples:
                 self.latency_samples.append(latency_ms)
@@ -1263,6 +1287,9 @@ class LoadController:
     def snapshot(self):
         with self.lock:
             elapsed = max(MONOTONIC_TIME() - self.started_at, 1e-9)
+            client_cpu_percent = (
+                (_process_cpu_seconds() - self.started_cpu_seconds) / elapsed * 100.0
+            )
             latencies = sorted(self.latency_samples)
             return {
                 "elapsed_seconds": elapsed,
@@ -1275,6 +1302,8 @@ class LoadController:
                 "requests_in_flight": self.requests_in_flight,
                 "rows_per_second": self.succeeded / elapsed,
                 "requests_per_second": self.request_attempts / elapsed,
+                "client_cpu_percent": client_cpu_percent,
+                "coordinator_requests": dict(self.coordinator_requests),
                 "latency_ms": {
                     "sample_count": len(latencies),
                     "p50": _percentile(latencies, 0.50),
@@ -1342,20 +1371,39 @@ def _sync_worker(
 
 
 class _AsyncCompletion:
-    def __init__(self, started_at):
+    def __init__(self, started_at, completed_queue):
         self.started_at = started_at
         self.completed_at = None
         self.error = None
-        self.done = threading.Event()
+        self.request = None
+        self.future = None
+        self.coordinator = None
+        self.completed_queue = completed_queue
+
+    def capture_coordinator(self):
+        host = getattr(self.future, "coordinator_host", None)
+        if host is None:
+            return
+        endpoint = getattr(host, "endpoint", None)
+        address = getattr(endpoint, "address", None) or getattr(host, "address", None)
+        port = getattr(endpoint, "port", None)
+        if address is not None and port is not None:
+            self.coordinator = "{}:{}".format(address, port)
+        elif address is not None:
+            self.coordinator = str(address)
+        else:
+            self.coordinator = str(host)
 
     def on_success(self, _result):
+        self.capture_coordinator()
         self.completed_at = MONOTONIC_TIME()
-        self.done.set()
+        self.completed_queue.put(self)
 
     def on_error(self, error):
         self.error = error
+        self.capture_coordinator()
         self.completed_at = MONOTONIC_TIME()
-        self.done.set()
+        self.completed_queue.put(self)
 
 
 def _make_async_statement(prepared, config, value_rows):
@@ -1373,9 +1421,23 @@ def _make_async_statement(prepared, config, value_rows):
 
 
 def _submit_async_request(
-    session, prepared, config, rows, value_rows, attempt, controller
+    session,
+    prepared,
+    config,
+    rows,
+    value_rows,
+    attempt,
+    controller,
+    completed_queue,
 ):
-    completion = _AsyncCompletion(MONOTONIC_TIME())
+    completion = _AsyncCompletion(MONOTONIC_TIME(), completed_queue)
+    request = {
+        "rows": rows,
+        "value_rows": value_rows,
+        "attempt": attempt,
+        "completion": completion,
+    }
+    completion.request = request
     controller.begin_request()
     try:
         statement, parameters = _make_async_statement(prepared, config, value_rows)
@@ -1384,15 +1446,11 @@ def _submit_async_request(
             future = session.execute_async(statement, timeout=timeout)
         else:
             future = session.execute_async(statement, parameters, timeout=timeout)
+        completion.future = future
         future.add_callbacks(completion.on_success, completion.on_error)
     except Exception as exc:  # noqa: BLE001 - driver exceptions vary by release.
         completion.on_error(exc)
-    return {
-        "rows": rows,
-        "value_rows": value_rows,
-        "attempt": attempt,
-        "completion": completion,
-    }
+    return request
 
 
 def _async_worker(
@@ -1407,11 +1465,12 @@ def _async_worker(
     write_mode = workload["write_mode"]
     rows_per_request = workload["batch_size"] if write_mode == "unlogged_batch" else 1
     max_attempts = workload["max_retries"] + 1
-    pending = deque()
+    completed_queue = queue_module.Queue()
+    outstanding = 0
     exhausted = False
 
-    while pending or not exhausted:
-        while len(pending) < request_window and not exhausted:
+    while outstanding or not exhausted:
+        while outstanding < request_window and not exhausted:
             logical_indexes = controller.claim_many(
                 rows_per_request,
                 stay_within_group=(write_mode == "unlogged_batch"),
@@ -1432,47 +1491,51 @@ def _async_worker(
                 row_indexes = logical_indexes
             rows = [generator.generate(index) for index in row_indexes]
             value_rows = [generator.bind_values(row) for row in rows]
-            pending.append(
-                _submit_async_request(
-                    session,
-                    prepared,
-                    config,
-                    rows,
-                    value_rows,
-                    attempt=1,
-                    controller=controller,
-                )
+            _submit_async_request(
+                session,
+                prepared,
+                config,
+                rows,
+                value_rows,
+                attempt=1,
+                controller=controller,
+                completed_queue=completed_queue,
             )
+            outstanding += 1
 
-        if not pending:
+        if not outstanding:
             continue
-        request = pending.popleft()
-        completion = request["completion"]
-        completion.done.wait()
+        completion = completed_queue.get()
+        outstanding -= 1
+        request = completion.request
         latency_ms = (completion.completed_at - completion.started_at) * 1000
         if completion.error is None:
-            controller.record_request(latency_ms, failed=False)
+            controller.record_request(
+                latency_ms, failed=False, coordinator=completion.coordinator
+            )
             controller.complete_success_many(request["rows"])
             continue
 
-        controller.record_request(latency_ms, failed=True)
+        controller.record_request(
+            latency_ms, failed=True, coordinator=completion.coordinator
+        )
         if request["attempt"] < max_attempts and not controller.stop_event.is_set():
             backoff = float(workload["retry_backoff_seconds"]) * (
                 2 ** (request["attempt"] - 1)
             )
             controller.stop_event.wait(backoff)
             if not controller.stop_event.is_set():
-                pending.append(
-                    _submit_async_request(
-                        session,
-                        prepared,
-                        config,
-                        request["rows"],
-                        request["value_rows"],
-                        attempt=request["attempt"] + 1,
-                        controller=controller,
-                    )
+                _submit_async_request(
+                    session,
+                    prepared,
+                    config,
+                    request["rows"],
+                    request["value_rows"],
+                    attempt=request["attempt"] + 1,
+                    controller=controller,
+                    completed_queue=completed_queue,
                 )
+                outstanding += 1
                 continue
         controller.complete_failure_many(completion.error, len(request["rows"]))
 
@@ -1555,10 +1618,20 @@ def run_load(session, prepared, config, generator=None, show_progress=True):
     controller = LoadController(config)
     workload = config["workload"]
     concurrency = workload["concurrency"]
+    sessions = list(session) if isinstance(session, (list, tuple)) else [session]
     if workload["write_mode"] == "sync":
         worker_specs = [
-            (_sync_worker, (session, prepared, config, generator, controller))
-            for _ in ITER_RANGE(concurrency)
+            (
+                _sync_worker,
+                (
+                    sessions[worker_index % len(sessions)],
+                    prepared,
+                    config,
+                    generator,
+                    controller,
+                ),
+            )
+            for worker_index in ITER_RANGE(concurrency)
         ]
     else:
         producer_count = min(workload["producer_threads"], concurrency)
@@ -1571,7 +1644,7 @@ def run_load(session, prepared, config, generator=None, show_progress=True):
                 (
                     _async_worker,
                     (
-                        session,
+                        sessions[producer_index % len(sessions)],
                         prepared,
                         config,
                         generator,
@@ -1584,6 +1657,7 @@ def run_load(session, prepared, config, generator=None, show_progress=True):
     summary = controller.snapshot()
     summary["write_mode"] = workload["write_mode"]
     summary["configured_concurrency"] = concurrency
+    summary["sessions"] = len(sessions)
     summary["producer_threads"] = (
         concurrency if workload["write_mode"] == "sync" else producer_count
     )
@@ -1602,10 +1676,14 @@ def print_progress(summary, config):
     effective_batch_size = (
         workload["batch_size"] if workload["write_mode"] == "unlogged_batch" else 1
     )
+    coordinator_text = ",".join(
+        "{}={}".format(host, count)
+        for host, count in sorted(summary["coordinator_requests"].items())
+    )
     print(
         ">>> progress utc={} elapsed={:.1f}s mode={} batch={} rows={}{} failed={} "
         "inflight_req={} inflight_rows={} row_rate={:.1f}/s req_rate={:.1f}/s "
-        "p95={:.3f}ms".format(
+        "p95={:.3f}ms client_cpu={:.1f}% coordinators={}".format(
             _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
             summary["elapsed_seconds"],
             workload["write_mode"],
@@ -1618,6 +1696,8 @@ def print_progress(summary, config):
             summary["rows_per_second"],
             summary["requests_per_second"],
             latency["p95"],
+            summary["client_cpu_percent"],
+            coordinator_text or "unavailable",
         ),
     )
     sys.stdout.flush()
@@ -1718,9 +1798,12 @@ def run_self_test(config):
     else:
         raise RuntimeError("self-test accepted an unsafe cross-partition batch schema")
 
-    session = _SelfTestSession(fail_first_async=True)
+    sessions = [
+        _SelfTestSession(fail_first_async=True),
+        _SelfTestSession(),
+    ]
     summary, _ = run_load(
-        session,
+        sessions,
         prepared=object(),
         config=test_config,
         generator=generator,
@@ -1730,11 +1813,14 @@ def run_self_test(config):
         raise RuntimeError("self-test concurrent load mismatch: {}".format(summary))
     if summary["write_mode"] != "async" or summary["request_attempts"] != 258:
         raise RuntimeError("self-test async transport mismatch: {}".format(summary))
+    if summary["sessions"] != 2:
+        raise RuntimeError("self-test session fanout mismatch: {}".format(summary))
     if summary["request_errors"] != 1:
         raise RuntimeError("self-test async retry mismatch: {}".format(summary))
     if summary["requests_in_flight"] != 0 or summary["in_flight"] != 0:
         raise RuntimeError("self-test left in-flight work: {}".format(summary))
-    if len(session.rows) != 257:
+    session_row_counts = [len(session.rows) for session in sessions]
+    if sum(session_row_counts) != 257 or not all(session_row_counts):
         raise RuntimeError("self-test fake session row count mismatch")
 
     natural_config = copy.deepcopy(test_config)
@@ -1756,6 +1842,7 @@ def run_self_test(config):
         "stdlib_only": True,
         "concurrent_rows": summary["succeeded_rows"],
         "async_requests": summary["request_attempts"],
+        "session_row_counts": session_row_counts,
         "window_counts": window_counts,
         "timeline_counts": timeline_counts,
         "same_partition_batch_groups": 4,
@@ -1951,13 +2038,24 @@ def connect(config):
             context.load_cert_chain(ssl_config["client_cert"], ssl_config["client_key"])
         cluster_args["ssl_context"] = context
     cluster = Cluster(**cluster_args)
+    sessions = []
     try:
-        session = cluster.connect()
-        session.default_timeout = float(connection["request_timeout_seconds"])
+        for _ in ITER_RANGE(connection["sessions"]):
+            session = cluster.connect()
+            session.default_timeout = float(connection["request_timeout_seconds"])
+            sessions.append(session)
     except BaseException:
         cluster.shutdown()
         raise
-    return cluster, session
+    print(
+        ">>> Driver protocol_version={} sessions={} discovered_hosts={}".format(
+            getattr(cluster, "protocol_version", "unknown"),
+            len(sessions),
+            len(cluster.metadata.all_hosts()),
+        )
+    )
+    sys.stdout.flush()
+    return cluster, sessions
 
 
 def run_schema_setup(session, config):
@@ -2016,6 +2114,7 @@ def config_summary(config):
             config["connection"]["cassandra_home"]
             or os.environ.get("CASSANDRA_HOME", "auto/not-set")
         ),
+        "sessions": config["connection"]["sessions"],
         "write_mode": workload["write_mode"],
         "concurrency": workload["concurrency"],
         "producer_threads": workload["producer_threads"],
@@ -2102,6 +2201,11 @@ def build_argument_parser():
     parser.add_argument(
         "--cassandra-home",
         help="reuse the bundled driver from CASSANDRA_HOME/lib, like cqlsh.py",
+    )
+    parser.add_argument(
+        "--sessions",
+        type=int,
+        help="driver Session count; each adds one protocol-v3+ connection per host",
     )
     parser.add_argument(
         "--write-mode",
@@ -2229,7 +2333,8 @@ def main(argv=None):
             + ":{}".format(config["connection"]["port"])
         )
         sys.stdout.flush()
-        cluster, session = connect(config)
+        cluster, sessions = connect(config)
+        session = sessions[0]
         run_schema_setup(session, config)
         prepared = prepare_insert(session, config)
         verification_prepared = prepare_verification(session, config)
@@ -2251,7 +2356,7 @@ def main(argv=None):
             )
         )
         sys.stdout.flush()
-        load_summary, sample_rows = run_load(session, prepared, config)
+        load_summary, sample_rows = run_load(sessions, prepared, config)
         verification = run_verification(
             session, config, sample_rows, statement=verification_prepared
         )

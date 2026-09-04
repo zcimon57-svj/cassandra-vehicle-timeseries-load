@@ -67,6 +67,8 @@ driver。该安装属于最后兜底，不是默认步骤。
 
 - `contact_points`、端口和 `local_dc`；
 - 通常保持 `cassandra_home` 为空并使用环境变量；也可填写 Cassandra 安装根目录；
+- `sessions` 默认 1；protocol v3+ 下每个 Session 会为每个本地节点建立一条连接，
+  可用 2 或 4 做受控对比；
 - keyspace、table、建表 CQL 与列；
 - `partition_key_columns` 必须与真实表分区键一致；batch 模式据此执行安全校验；
 - 示例按隔离的三节点测试集群使用 `SimpleStrategy/rf=3`；正式拓扑应改成
@@ -104,12 +106,14 @@ python cassandra_vehicle_timeseries_load.py \
 
 | `write_mode` | `concurrency` 含义 | 用途 |
 | --- | --- | --- |
-| `async` | 全局最大 native-protocol in-flight 请求数 | 默认；prepared statement + `execute_async`，通常先用它压吞吐 |
-| `unlogged_batch` | 最大 in-flight batch 请求数 | 每个 batch 只包含同一 `vehicle_id` 分区，减少网络往返 |
+| `async` | 全局最大 native-protocol in-flight 请求数 | 单行 prepared statement + `execute_async` + completion queue，用作基线和通用模式 |
+| `unlogged_batch` | 最大 in-flight batch 请求数 | 示例默认；每个 batch 只包含同一 `vehicle_id` 分区，减少网络往返 |
 | `sync` | 同步写线程数 | 兼容和问题定位；不是高吞吐默认值 |
 
 `producer_threads` 只是生成数据、提交异步请求的少量 Python 线程，不应等同于
-`concurrency`。默认值是 8 个 producer、256 个 in-flight 请求。
+`concurrency`。每个 future 完成后直接进入 completion queue，哪个先完成就先回收并
+立即补位，不会按提交顺序等待慢请求。示例默认是 8 个 producer、80 个 batch
+in-flight、每批 8 行，即最多约 640 行未完成。
 
 写满 1000 万行，使用异步 pipeline：
 
@@ -137,6 +141,9 @@ python cassandra_vehicle_timeseries_load.py \
   --producer-threads 8 --concurrency 64 --rows 10m
 ```
 
+如需判断 protocol v3+ 的单连接是否成为瓶颈，在其他参数不变时仅增加
+`--sessions 2` 做 A/B；不要同时修改 batch、sessions 和 concurrency，否则无法归因。
+
 这里的 64 是 batch 请求数；每批 8 行时，最多约 512 行处于未完成状态。脚本要求
 `partition_key_columns` 只能使用 `vehicle_id` 或常量生成器，并再次按生成后的
 `vehicle_id` 分组。建议从
@@ -159,8 +166,10 @@ key 会帮助请求优先发往对应副本。
 建议依次测试并记录每档稳定 5–10 分钟的 rows/s、requests/s、P95/P99：
 
 1. `async`: in-flight 128、256、512、1024；
-2. 如果单请求网络开销明显，再测同分区 batch 4、8、16；
-3. 如果压测机单进程 CPU 已满但集群仍有余量，再启动多个进程，每个进程使用不同
+2. 单行写的 in-flight 已满但服务端 CPU 仍低时，对比 `--sessions 1/2/4`；每增加一个
+   Session 都会增加每节点连接数，不要无上限增加；
+3. 如果单请求网络开销明显，再测同分区 batch 4、8、16；
+4. 如果压测机单进程 CPU 已满但集群仍有余量，再启动多个进程，每个进程使用不同
    `--vehicle-id-prefix`，避免写成同一批主键。
 
 压测机最好与 Cassandra 节点分离，同时观察压测机 CPU。如果客户端单核先到 100%，
@@ -222,11 +231,11 @@ ps -fp "$(cat vehicle-load.pid)"
 ```
 
 `workload.progress_interval_seconds` 默认每 5 秒输出一次并立即 flush；设为 `0` 可关闭。
-日志包含 UTC 时间、模式、batch 大小、已成功行数/目标、请求/行 in-flight、两种吞吐
-和请求 P95，例如：
+日志包含 UTC 时间、模式、batch 大小、已成功行数/目标、请求/行 in-flight、两种吞吐、
+请求 P95、压测进程 CPU 和各 coordinator 累计请求数，例如：
 
 ```text
->>> progress utc=2026-09-04T01:23:45Z elapsed=30.0s mode=async batch=1 rows=150000/1000000 (15.0%) failed=0 inflight_req=256 inflight_rows=256 row_rate=5000.0/s req_rate=5000.0/s p95=8.200ms
+>>> progress utc=2026-09-04T01:23:45Z elapsed=30.0s mode=async batch=1 rows=150000/1000000 (15.0%) failed=0 inflight_req=256 inflight_rows=256 row_rate=5000.0/s req_rate=5000.0/s p95=8.200ms client_cpu=72.0% coordinators=10.0.0.1:9042=50120,10.0.0.2:9042=49931,10.0.0.3:9042=49949
 ```
 
 正常完成后，日志末尾会输出完整 JSON 汇总和 `PASS:`；写入或抽样回读失败则输出
