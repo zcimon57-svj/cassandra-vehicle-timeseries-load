@@ -20,26 +20,41 @@
 
 ## 1. 准备
 
-支持 Python 2.7 和 Python 3。依赖文件会为 Python 2.7 固定安装最后一个仍声明支持
-它的 `cassandra-driver 3.25.0`，Python 3 则按版本选择后续 driver：
+脚本自身只使用 Python 标准库；连接 Cassandra 时只需要 Python Cassandra driver。
+优先直接复用目标 Cassandra 的 `cqlsh.py` 运行依赖，不需要另外安装包。
 
 以下命令在本工具目录（独立仓库中即仓库根目录）执行。
 
 ```bash
-python2.7 -m pip install -r requirements.txt
-# 或
-python3 -m pip install -r requirements.txt
-
 cp example-config.json /tmp/vehicle-load.json
+
+CASSANDRA_HOME=/path/to/cassandra \
+python cassandra_vehicle_timeseries_load.py \
+  --config /tmp/vehicle-load.json --check-config
 ```
 
-Python 2.7 已停止维护，只应在遗留、隔离的测试环境使用；生产或长期压测优先使用
-Python 3。若 Python 2 构建 driver 的 Cython 扩展失败，可用
-`CASS_DRIVER_NO_CYTHON=1` 安装纯 Python 版本。
+加载顺序为：
+
+1. `--cassandra-home`、配置文件的 `connection.cassandra_home` 或环境变量
+   `CASSANDRA_HOME`；
+2. Linux 发行版路径 `/usr/share/cassandra/lib`；
+3. 当前 Python 已经可以导入的 `cassandra` 模块；
+4. 以上均不可用时，才选择性执行 `python -m pip install -r requirements.txt`。
+
+自动发现逻辑与 Cassandra 3.11 `cqlsh.py` 一致：从 `lib/` 加载
+`cassandra-driver-internal-only-*.zip`，同时复用其中的 `futures-*.zip` 和
+`six-*.zip`。可对照
+[Apache Cassandra 3.11 cqlsh.py](https://github.com/apache/cassandra/blob/cassandra-3.11/bin/cqlsh.py)。
+脚本不直接依赖 PyYAML、requests、numpy、pandas、gevent 或其他第三方库。
+
+支持 Python 2.7 和 Python 3。Python 2.7 已停止维护，只应在遗留、隔离的测试环境
+使用；生产或长期压测优先使用 Python 3。`requirements.txt` 只是无 cqlsh bundle 时
+的可选兜底，并按 Python 版本选择兼容 driver。
 
 先修改 `/tmp/vehicle-load.json`：
 
 - `contact_points`、端口和 `local_dc`；
+- 通常保持 `cassandra_home` 为空并使用环境变量；也可填写 Cassandra 安装根目录；
 - keyspace、table、建表 CQL 与列；
 - 多节点环境不要直接沿用示例的 `SimpleStrategy/rf=1`；
 - 若集群启用认证，把 `username_env/password_env` 改为环境变量名，例如

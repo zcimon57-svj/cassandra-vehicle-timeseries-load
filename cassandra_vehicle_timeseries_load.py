@@ -10,6 +10,7 @@ from __future__ import print_function
 import argparse
 import calendar
 import copy
+import glob
 import hashlib
 import io
 import json
@@ -309,6 +310,7 @@ def validate_config(raw_config):
             "contact_points",
             "port",
             "local_dc",
+            "cassandra_home",
             "username_env",
             "password_env",
             "connect_timeout_seconds",
@@ -328,6 +330,11 @@ def validate_config(raw_config):
         raise ConfigError("connection.port must be <= 65535")
     _require_string(
         connection.setdefault("local_dc", ""), "connection.local_dc", allow_empty=True
+    )
+    _require_string(
+        connection.setdefault("cassandra_home", ""),
+        "connection.cassandra_home",
+        allow_empty=True,
     )
     _require_string(
         connection.setdefault("username_env", ""),
@@ -765,6 +772,8 @@ def _validate_column_generator(column, path):
 def apply_overrides(config, args):
     result = copy.deepcopy(dict(config))
     workload = result["workload"]
+    if getattr(args, "cassandra_home", None) is not None:
+        result["connection"]["cassandra_home"] = args.cassandra_home
     if args.concurrency is not None:
         workload["concurrency"] = args.concurrency
     if args.rows is not None:
@@ -1362,18 +1371,97 @@ def run_verification(
     }
 
 
-def connect(config):
+def _cqlsh_library_dirs(cassandra_home):
+    locations = []
+    requested = cassandra_home or os.environ.get("CASSANDRA_HOME", "")
+    if requested:
+        requested = os.path.abspath(os.path.expanduser(requested))
+        if os.path.isfile(requested) and os.path.basename(requested) == "cqlsh.py":
+            requested = os.path.dirname(os.path.dirname(requested))
+        if os.path.basename(requested) == "lib":
+            locations.append(requested)
+        else:
+            locations.append(os.path.join(requested, "lib"))
+    if sys.platform.startswith("linux"):
+        locations.append("/usr/share/cassandra/lib")
+    result = []
+    seen = set()
+    for location in locations:
+        normalized = os.path.realpath(location)
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def _bundled_cqlsh_paths(cassandra_home):
+    """Return driver and companion zip paths using Cassandra 3.11 cqlsh layout."""
+
+    if os.environ.get("CQLSH_NO_BUNDLED", "") and not cassandra_home:
+        return [], []
+    searched = _cqlsh_library_dirs(cassandra_home)
+    for lib_dir in searched:
+        driver_zips = glob.glob(
+            os.path.join(lib_dir, "cassandra-driver-internal-only-*.zip")
+        )
+        if not driver_zips:
+            continue
+        driver_zip = max(driver_zips)
+        filename = os.path.splitext(os.path.basename(driver_zip))[0]
+        version = filename[len("cassandra-driver-internal-only-") :]
+        paths = [os.path.join(driver_zip, "cassandra-driver-" + version)]
+        for prefix in ("futures-", "six-"):
+            companion_zips = glob.glob(os.path.join(lib_dir, prefix + "*.zip"))
+            if companion_zips:
+                paths.append(max(companion_zips))
+        return paths, searched
+    return [], searched
+
+
+def _load_cassandra_driver(cassandra_home):
+    paths, searched = _bundled_cqlsh_paths(cassandra_home)
+    for path in paths:
+        if path not in sys.path:
+            sys.path.insert(0, path)
     try:
+        import cassandra
         from cassandra.auth import PlainTextAuthProvider
         from cassandra.cluster import Cluster
         from cassandra.policies import DCAwareRoundRobinPolicy
     except ImportError as exc:
+        search_text = ", ".join(searched) if searched else "none"
         raise RuntimeError(
-            "cassandra-driver is not installed; run: "
-            "python -m pip install cassandra-driver ({})".format(exc)
+            "Python Cassandra driver is unavailable ({}). Run this script with "
+            "the same Python as cqlsh and set CASSANDRA_HOME or "
+            "--cassandra-home. Searched cqlsh lib directories: {}. "
+            "Only if no bundled driver exists, optionally install "
+            "requirements.txt.".format(exc, search_text)
         )
+    source = paths[0] if paths else "existing Python import path"
+    return (
+        cassandra,
+        PlainTextAuthProvider,
+        Cluster,
+        DCAwareRoundRobinPolicy,
+        source,
+    )
 
+
+def connect(config):
     connection = config["connection"]
+    (
+        cassandra_module,
+        PlainTextAuthProvider,
+        Cluster,
+        DCAwareRoundRobinPolicy,
+        driver_source,
+    ) = _load_cassandra_driver(connection["cassandra_home"])
+    print(
+        ">>> Cassandra driver version={} source={}".format(
+            getattr(cassandra_module, "__version__", "unknown"), driver_source
+        )
+    )
+    sys.stdout.flush()
     cluster_args = {
         "contact_points": connection["contact_points"],
         "port": connection["port"],
@@ -1472,6 +1560,10 @@ def config_summary(config):
         "target": qualified_table(config),
         "contact_points": config["connection"]["contact_points"],
         "port": config["connection"]["port"],
+        "cassandra_home": (
+            config["connection"]["cassandra_home"]
+            or os.environ.get("CASSANDRA_HOME", "auto/not-set")
+        ),
         "concurrency": workload["concurrency"],
         "total_rows": workload["total_rows"],
         "duration_seconds": workload["duration_seconds"],
@@ -1551,6 +1643,10 @@ def build_argument_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", required=True, help="JSON configuration path")
+    parser.add_argument(
+        "--cassandra-home",
+        help="reuse the bundled driver from CASSANDRA_HOME/lib, like cqlsh.py",
+    )
     parser.add_argument("--concurrency", type=int, help="override worker concurrency")
     parser.add_argument(
         "--rows", type=parse_count, help="override successful row target; 0 disables"

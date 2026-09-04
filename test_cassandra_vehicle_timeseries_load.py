@@ -296,6 +296,39 @@ class VehicleTimeseriesLoadTest(unittest.TestCase):
         self.assertEqual(load_tool.parse_count("10m"), 10000000)
         self.assertEqual(load_tool.parse_duration("30m"), 1800)
 
+    def test_discovers_the_same_bundled_zips_as_cqlsh(self):
+        cassandra_home = tempfile.mkdtemp(prefix="cassandra-home-")
+        lib_dir = os.path.join(cassandra_home, "lib")
+        os.mkdir(lib_dir)
+        filenames = [
+            "cassandra-driver-internal-only-3.25.0.zip",
+            "futures-3.3.0.zip",
+            "six-1.12.0.zip",
+        ]
+        try:
+            for filename in filenames:
+                with io.open(os.path.join(lib_dir, filename), "wb"):
+                    pass
+            paths, searched = load_tool._bundled_cqlsh_paths(cassandra_home)
+            self.assertEqual(searched[0], os.path.realpath(lib_dir))
+            self.assertEqual(
+                paths[0],
+                os.path.join(
+                    lib_dir,
+                    "cassandra-driver-internal-only-3.25.0.zip",
+                    "cassandra-driver-3.25.0",
+                ),
+            )
+            self.assertIn(os.path.join(lib_dir, "futures-3.3.0.zip"), paths)
+            self.assertIn(os.path.join(lib_dir, "six-1.12.0.zip"), paths)
+        finally:
+            for filename in filenames:
+                path = os.path.join(lib_dir, filename)
+                if os.path.exists(path):
+                    os.unlink(path)
+            os.rmdir(lib_dir)
+            os.rmdir(cassandra_home)
+
     def test_summary_json_is_written_in_python2_and_python3(self):
         output_dir = tempfile.mkdtemp(prefix="cassandra-load-summary-")
         output_path = os.path.join(output_dir, "summary.json")

@@ -5,6 +5,7 @@
     ],
     "port": 9042,
     "local_dc": "",
+    "cassandra_home": "",
     "username_env": "",
     "password_env": "",
     "connect_timeout_seconds": 10,
