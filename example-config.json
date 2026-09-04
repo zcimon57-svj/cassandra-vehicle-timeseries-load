@@ -1,0 +1,194 @@
+{
+  "connection": {
+    "contact_points": [
+      "127.0.0.1"
+    ],
+    "port": 9042,
+    "local_dc": "",
+    "username_env": "",
+    "password_env": "",
+    "connect_timeout_seconds": 10,
+    "request_timeout_seconds": 30,
+    "protocol_version": null,
+    "ssl": {
+      "enabled": false,
+      "ca_cert": "",
+      "client_cert": "",
+      "client_key": "",
+      "check_hostname": true
+    }
+  },
+  "schema": {
+    "keyspace": "chs_load_test",
+    "table": "vehicle_timeseries",
+    "temperature_source": "write_timestamp",
+    "temperature_column": "",
+    "create_keyspace_if_missing": true,
+    "create_table_if_missing": true,
+    "keyspace_cql": "CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    "table_cql": "CREATE TABLE IF NOT EXISTS {keyspace}.{table} (vehicle_id text, event_time_s bigint, timeline text, sample_seq bigint, time_window text, speed_kph double, engine_rpm int, coolant_temp_c double, battery_voltage double, fuel_percent double, latitude double, longitude double, heading_deg double, odometer_km double, status text, payload blob, PRIMARY KEY (vehicle_id, event_time_s, timeline, sample_seq)) WITH CLUSTERING ORDER BY (event_time_s ASC, timeline ASC, sample_seq ASC) AND Z06_CHS = {'chs_time':'3600','time_unit':'s'}",
+    "truncate_before_load": false,
+    "columns": [
+      {
+        "name": "vehicle_id",
+        "generator": "vehicle_id"
+      },
+      {
+        "name": "event_time_s",
+        "generator": "event_time_seconds"
+      },
+      {
+        "name": "timeline",
+        "generator": "timeline"
+      },
+      {
+        "name": "sample_seq",
+        "generator": "sequence"
+      },
+      {
+        "name": "time_window",
+        "generator": "time_window"
+      },
+      {
+        "name": "speed_kph",
+        "generator": "random_float",
+        "min": 0,
+        "max": 130,
+        "decimals": 2
+      },
+      {
+        "name": "engine_rpm",
+        "generator": "random_int",
+        "min": 700,
+        "max": 6500
+      },
+      {
+        "name": "coolant_temp_c",
+        "generator": "random_float",
+        "min": 72,
+        "max": 108,
+        "decimals": 2
+      },
+      {
+        "name": "battery_voltage",
+        "generator": "random_float",
+        "min": 11.8,
+        "max": 14.8,
+        "decimals": 3
+      },
+      {
+        "name": "fuel_percent",
+        "generator": "random_float",
+        "min": 5,
+        "max": 100,
+        "decimals": 2
+      },
+      {
+        "name": "latitude",
+        "generator": "random_float",
+        "min": 31.2,
+        "max": 31.25,
+        "decimals": 6
+      },
+      {
+        "name": "longitude",
+        "generator": "random_float",
+        "min": 121.4,
+        "max": 121.5,
+        "decimals": 6
+      },
+      {
+        "name": "heading_deg",
+        "generator": "random_float",
+        "min": 0,
+        "max": 359.99,
+        "decimals": 2
+      },
+      {
+        "name": "odometer_km",
+        "generator": "linear_float",
+        "base": 10000,
+        "step": 0.02,
+        "vehicle_step": 100,
+        "decimals": 2
+      },
+      {
+        "name": "status",
+        "generator": "choice",
+        "values": [
+          "RUNNING",
+          "IDLING",
+          "PARKED",
+          "CHARGING"
+        ]
+      },
+      {
+        "name": "payload",
+        "generator": "random_blob",
+        "size": 256
+      }
+    ]
+  },
+  "workload": {
+    "concurrency": 32,
+    "total_rows": 100000,
+    "duration_seconds": 0,
+    "rate_limit_rows_per_second": 0,
+    "vehicle_count": 1000,
+    "vehicle_id_prefix": "vehicle-",
+    "vehicle_id_width": 8,
+    "event_time_mode": "natural_write_time",
+    "timelines": [
+      {
+        "name": "gps",
+        "interval_seconds": 5
+      },
+      {
+        "name": "powertrain",
+        "interval_seconds": 1
+      },
+      {
+        "name": "battery",
+        "interval_seconds": 10
+      }
+    ],
+    "reference_time_utc": null,
+    "time_windows": [
+      {
+        "name": "cold",
+        "weight": 4,
+        "start_offset_seconds": -604800,
+        "end_offset_seconds": -86400
+      },
+      {
+        "name": "hot",
+        "weight": 1,
+        "start_offset_seconds": -300,
+        "end_offset_seconds": 0
+      }
+    ],
+    "timestamp_jitter_seconds": 0,
+    "ttl_seconds": null,
+    "consistency_level": "LOCAL_ONE",
+    "max_retries": 2,
+    "retry_backoff_seconds": 0.05,
+    "max_errors": 0,
+    "progress_interval_seconds": 5,
+    "random_seed": 20260903,
+    "latency_sample_size": 10000
+  },
+  "verification": {
+    "enabled": true,
+    "sample_size": 20,
+    "key_columns": [
+      "vehicle_id",
+      "event_time_s",
+      "timeline",
+      "sample_seq"
+    ],
+    "consistency_level": "LOCAL_ONE"
+  },
+  "report": {
+    "summary_json": ""
+  }
+}
