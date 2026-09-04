@@ -1303,7 +1303,10 @@ def print_progress(summary, config):
     progress = "/{} ({:.1f}%)".format(total, completed * 100.0 / total) if total else ""
     latency = summary["latency_ms"]
     print(
-        ">>> rows={}{} failed={} inflight={} rate={:.1f}/s p95={:.3f}ms".format(
+        ">>> progress utc={} elapsed={:.1f}s rows={}{} failed={} "
+        "inflight={} rate={:.1f}/s p95={:.3f}ms".format(
+            _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            summary["elapsed_seconds"],
             completed,
             progress,
             summary["failed_rows"],
@@ -1313,6 +1316,90 @@ def print_progress(summary, config):
         ),
     )
     sys.stdout.flush()
+
+
+class _SelfTestSession:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.rows = []
+
+    def execute(self, _prepared, values, timeout=None):
+        del timeout
+        with self.lock:
+            self.rows.append(values)
+
+
+def run_self_test(config):
+    test_config = copy.deepcopy(config)
+    test_config["schema"]["create_keyspace_if_missing"] = False
+    test_config["schema"]["create_table_if_missing"] = False
+    test_config["schema"]["temperature_source"] = "custom_ck"
+    test_config["schema"]["temperature_column"] = "event_time_s"
+    test_config["verification"]["enabled"] = False
+    test_config["workload"].update(
+        {
+            "concurrency": 8,
+            "total_rows": 257,
+            "duration_seconds": 0,
+            "rate_limit_rows_per_second": 0,
+            "vehicle_count": 2,
+            "event_time_mode": "weighted_time_windows",
+            "reference_time_utc": "2026-09-01T00:00:00Z",
+            "progress_interval_seconds": 0,
+        }
+    )
+    test_config = validate_config(test_config)
+    generator = VehicleRowGenerator(test_config)
+    preview = [generator.generate(index) for index in ITER_RANGE(15)]
+    window_counts = {}
+    timeline_counts = {}
+    for row in preview:
+        window_counts[row["time_window"]] = window_counts.get(row["time_window"], 0) + 1
+        timeline_counts[row["timeline"]] = timeline_counts.get(row["timeline"], 0) + 1
+    if window_counts != {"cold": 12, "hot": 3}:
+        raise RuntimeError(
+            "self-test window distribution mismatch: {}".format(window_counts)
+        )
+    if timeline_counts != {"gps": 5, "powertrain": 5, "battery": 5}:
+        raise RuntimeError(
+            "self-test timeline distribution mismatch: {}".format(timeline_counts)
+        )
+
+    session = _SelfTestSession()
+    summary, _ = run_load(
+        session,
+        prepared=object(),
+        config=test_config,
+        generator=generator,
+        show_progress=False,
+    )
+    if summary["succeeded_rows"] != 257 or summary["failed_rows"] != 0:
+        raise RuntimeError("self-test concurrent load mismatch: {}".format(summary))
+    if len(session.rows) != 257:
+        raise RuntimeError("self-test fake session row count mismatch")
+
+    natural_config = copy.deepcopy(test_config)
+    natural_config["schema"]["temperature_source"] = "write_timestamp"
+    natural_config["schema"]["temperature_column"] = ""
+    natural_config["workload"]["event_time_mode"] = "natural_write_time"
+    natural_config["workload"]["time_windows"] = []
+    natural_config = validate_config(natural_config)
+    natural_row = VehicleRowGenerator(natural_config).generate(
+        7, now_epoch_seconds=1788220999.875
+    )
+    if natural_row["event_time_s"] != 1788220999:
+        raise RuntimeError("self-test natural event time mismatch")
+    if natural_row["time_window"] != "natural":
+        raise RuntimeError("self-test natural window label mismatch")
+
+    return {
+        "python": sys.version.split()[0],
+        "stdlib_only": True,
+        "concurrent_rows": summary["succeeded_rows"],
+        "window_counts": window_counts,
+        "timeline_counts": timeline_counts,
+        "natural_event_time": natural_row["event_time_s"],
+    }
 
 
 def _consistency_value(name):
@@ -1434,8 +1521,9 @@ def _load_cassandra_driver(cassandra_home):
             "Python Cassandra driver is unavailable ({}). Run this script with "
             "the same Python as cqlsh and set CASSANDRA_HOME or "
             "--cassandra-home. Searched cqlsh lib directories: {}. "
-            "Only if no bundled driver exists, optionally install "
-            "requirements.txt.".format(exc, search_text)
+            "Only if no bundled driver exists, optionally install a "
+            "cassandra-driver version compatible with this Python and "
+            "Cassandra release.".format(exc, search_text)
         )
     source = paths[0] if paths else "existing Python import path"
     return (
@@ -1678,6 +1766,13 @@ def build_argument_parser():
         help="validate and print the effective target; do not connect",
     )
     parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "run built-in stdlib-only generation and concurrency tests; do not connect"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         nargs="?",
         const=5,
@@ -1706,6 +1801,11 @@ def main(argv=None):
 
     print(json.dumps(config_summary(config), ensure_ascii=True, indent=2))
     sys.stdout.flush()
+    if args.self_test:
+        result = run_self_test(config)
+        print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
+        print("PASS: built-in self-test; no Cassandra connection was made")
+        return EXIT_OK
     if args.check_config:
         print("PASS: configuration is valid; no Cassandra connection was made")
         return EXIT_OK

@@ -1,6 +1,0 @@
-# Optional fallback only. Normally reuse the driver bundled for cqlsh.py by
-# setting CASSANDRA_HOME; the load generator has no other third-party imports.
-cassandra-driver==3.25.0; python_version < "3.7"
-cassandra-driver>=3.26,<3.29; python_version >= "3.7" and python_version < "3.9"
-cassandra-driver>=3.29,<3.30; python_version >= "3.9" and python_version < "3.10"
-cassandra-driver>=3.30,<4; python_version >= "3.10"

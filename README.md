@@ -25,6 +25,15 @@
 
 以下命令在本工具目录（独立仓库中即仓库根目录）执行。
 
+实际复制到测试机时只需要两个文件：
+
+```text
+cassandra_vehicle_timeseries_load.py
+example-config.json
+```
+
+README 和 `.gitignore` 都不是运行依赖。
+
 ```bash
 cp example-config.json /tmp/vehicle-load.json
 
@@ -39,7 +48,7 @@ python cassandra_vehicle_timeseries_load.py \
    `CASSANDRA_HOME`；
 2. Linux 发行版路径 `/usr/share/cassandra/lib`；
 3. 当前 Python 已经可以导入的 `cassandra` 模块；
-4. 以上均不可用时，才选择性执行 `python -m pip install -r requirements.txt`。
+4. 以上均不可用时，才考虑额外安装 Python Cassandra driver。
 
 自动发现逻辑与 Cassandra 3.11 `cqlsh.py` 一致：从 `lib/` 加载
 `cassandra-driver-internal-only-*.zip`，同时复用其中的 `futures-*.zip` 和
@@ -48,8 +57,9 @@ python cassandra_vehicle_timeseries_load.py \
 脚本不直接依赖 PyYAML、requests、numpy、pandas、gevent 或其他第三方库。
 
 支持 Python 2.7 和 Python 3。Python 2.7 已停止维护，只应在遗留、隔离的测试环境
-使用；生产或长期压测优先使用 Python 3。`requirements.txt` 只是无 cqlsh bundle 时
-的可选兜底，并按 Python 版本选择兼容 driver。
+使用；生产或长期压测优先使用 Python 3。确实没有 cqlsh bundle 时，Python 2.7 可
+使用 `cassandra-driver==3.25.0`；Python 3 应选择与本机 Python/Cassandra 版本兼容的
+driver。该安装属于最后兜底，不是默认步骤。
 
 先修改 `/tmp/vehicle-load.json`：
 
@@ -103,14 +113,62 @@ python cassandra_vehicle_timeseries_load.py \
 如果行数和时长都大于 0，任一限制先到即停止。行数指成功写入量；瞬时失败会按配置
 重试。最终仍有失败或抽样回读缺失时，脚本退出码为 1。
 
-## 4. 温度来源与业务时间构造
+## 4. 前台、nohup 与进度日志
+
+前台运行：
+
+```bash
+export CASSANDRA_HOME=/path/to/cassandra
+python -u cassandra_vehicle_timeseries_load.py \
+  --config example-config.json
+```
+
+推荐的 nohup 运行方式：
+
+```bash
+export CASSANDRA_HOME=/path/to/cassandra
+nohup python -u cassandra_vehicle_timeseries_load.py \
+  --config example-config.json \
+  > vehicle-load.log 2>&1 &
+
+echo $! > vehicle-load.pid
+```
+
+按时长后台压测：
+
+```bash
+nohup python -u cassandra_vehicle_timeseries_load.py \
+  --config example-config.json \
+  --rows 0 --duration 24h --concurrency 64 \
+  > vehicle-load.log 2>&1 &
+```
+
+查看进度和进程：
+
+```bash
+tail -f vehicle-load.log
+ps -fp "$(cat vehicle-load.pid)"
+```
+
+`workload.progress_interval_seconds` 默认每 5 秒输出一次并立即 flush；设为 `0` 可关闭。
+日志包含 UTC 时间、已成功行数/目标、失败数、in-flight、实时吞吐和 P95，例如：
+
+```text
+>>> progress utc=2026-09-04T01:23:45Z elapsed=30.0s rows=150000/1000000 (15.0%) failed=0 inflight=64 rate=5000.0/s p95=8.200ms
+```
+
+正常完成后，日志末尾会输出完整 JSON 汇总和 `PASS:`；写入或抽样回读失败则输出
+`FAIL:` 并返回非零退出码。`python -u` 与脚本的显式 flush 可以确保重定向日志及时
+可见。
+
+## 5. 温度来源与业务时间构造
 
 这两个概念必须分开：
 
 - `schema.temperature_source` 决定 CHS 真正使用哪个温度来源；
 - `workload.event_time_mode` 只决定脚本如何生成 `event_time_s` 等业务时间列。
 
-### 4.1 Cassandra write timestamp 作为温度（默认）
+### 5.1 Cassandra write timestamp 作为温度（默认）
 
 ```json
 "temperature_source": "write_timestamp",
@@ -139,7 +197,7 @@ python cassandra_vehicle_timeseries_load.py \
   --duration 30m --rows 0
 ```
 
-### 4.2 自定义 CK 列作为温度
+### 5.2 自定义 CK 列作为温度
 
 如果要让 `event_time_s` 控制温度，配置必须改为：
 
@@ -186,7 +244,7 @@ python cassandra_vehicle_timeseries_load.py \
 无论使用哪种来源，时间超过阈值都不等于 SST 已经入冷；仍需按目标版本流程执行或
 等待 flush、compact、separate 和 move，并用集群指标验证。
 
-## 5. 列生成器
+## 6. 列生成器
 
 每个 `schema.columns[]` 由 `name` 和 `generator` 定义。支持：
 
@@ -198,14 +256,16 @@ python cassandra_vehicle_timeseries_load.py \
 
 配置检查会拒绝生成 `null` 的规则，避免 INSERT 在测试表中意外制造 tombstone。
 
-## 6. 本地自测
+## 7. 内置自测
 
 自测不需要 Cassandra driver 或 Cassandra 集群：
 
 ```bash
-python2.7 test_cassandra_vehicle_timeseries_load.py
-python3 -m unittest -v \
-  test_cassandra_vehicle_timeseries_load.py
+python2.7 -S cassandra_vehicle_timeseries_load.py \
+  --config example-config.json --self-test
+
+python3 -S cassandra_vehicle_timeseries_load.py \
+  --config example-config.json --self-test
 ```
 
 真实 Cassandra 连通、DDL 扩展和 CHS 入冷必须在目标隔离集群上验证。
