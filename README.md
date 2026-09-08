@@ -1,400 +1,187 @@
-# Cassandra 车辆时序数据压测脚本
+# Cassandra 车辆时序压测工具
 
-`cassandra_vehicle_timeseries_load.py` 面向隔离测试集群持续写入车辆时序数据。一个
-`vehicle_id` 会轮流产生 `gps`、`powertrain`、`battery` 三条时间线，每行包含速度、
-转速、温度、电压、油量、经纬度、里程和可调大小的随机 payload。
+一个 Python 脚本 + 一个 JSON 配置即可运行。支持 Python 2.7 / Python 3，运行依赖只有现有 Cassandra driver；优先复用 cqlsh 自带依赖，不需要安装 YAML、numpy、gevent 或监控库。
 
-脚本支持：
+v2 使用独立写入进程、prepared statement、有界异步请求和可选同分区 UNLOGGED BATCH。进程之间只传统计信息，不传逐行数据。普通 Cassandra 可以用于写入性能测试；CHS 冷热迁移只能在支持该扩展的实例验证。
 
-- 配置文件控制连接、建表 CQL、列与数据生成规则；
-- 默认使用 Cassandra mutation write timestamp 作为温度，不回填历史温度，数据随
-  `chs_time` 自然由热变冷；
-- 可选在同一轮按权重生成冷、热多个业务时间窗口，长压时也不会漂出窗口；
-- prepared statement + token-aware 路由 + 有界 `execute_async` pipeline；
-- 可选同一车辆分区内的小型 `UNLOGGED BATCH`，不会跨 partition key 组 batch；
-- `--concurrency`、`--rows`、`--duration`、`--rate` 覆盖 in-flight、成功写入行数、时长和限速；
-- 失败重试、请求/行吞吐、in-flight、P50/P95/P99 统计；
-- 写完后按完整主键抽样回读，而不是对大表执行昂贵的 `COUNT(*)`；
-- `--check-config` 和 `--dry-run` 不连接 Cassandra；
-- 不执行 `DROP`/`DELETE`。只有配置显式打开 truncate 且命令行同时给出
-  `--allow-destructive` 才会清表；清表前还会先 prepare 写入与回读 CQL，确认目标表
-  和列契约有效。
+## 快速开始
 
-## 1. 准备
-
-脚本自身只使用 Python 标准库；连接 Cassandra 时只需要 Python Cassandra driver。
-优先直接复用目标 Cassandra 的 `cqlsh.py` 运行依赖，不需要另外安装包。
-
-以下命令在本工具目录（独立仓库中即仓库根目录）执行。
-
-实际复制到测试机时只需要两个文件：
+部署只需要：
 
 ```text
 cassandra_vehicle_timeseries_load.py
 example-config.json
 ```
 
-README 和 `.gitignore` 都不是运行依赖。
+修改配置中的 contact_points、local_dc、keyspace、table 和建表 CQL。凭据通过 username_env/password_env 指定环境变量，不写入 JSON。
 
 ```bash
-cp example-config.json /tmp/vehicle-load.json
+export CASSANDRA_HOME=/path/to/cassandra
+python cassandra_vehicle_timeseries_load.py --config example-config.json --check-config
+python cassandra_vehicle_timeseries_load.py --config example-config.json --dry-run 5
 
-CASSANDRA_HOME=/path/to/cassandra \
-python cassandra_vehicle_timeseries_load.py \
-  --config /tmp/vehicle-load.json --check-config
+# 少量真实写入；不改表的温度规则
+python -u cassandra_vehicle_timeseries_load.py --config example-config.json \
+  --processes 1 --producer-threads 1 --concurrency 8 --rows 1000 --duration 0
 ```
 
-加载顺序为：
+普通 Cassandra 单节点：从 table_cql 中删除末尾的 `AND Z06_CHS = {...}`，把测试 keyspace 的 RF 改为 1。其余默认列和主键不变。不要对已有生产 keyspace 修改 RF；CREATE IF NOT EXISTS 不会修改已有 schema。
 
-1. `--cassandra-home`、配置文件的 `connection.cassandra_home` 或环境变量
-   `CASSANDRA_HOME`；
-2. Linux 发行版路径 `/usr/share/cassandra/lib`；
-3. 当前 Python 已经可以导入的 `cassandra` 模块；
-4. 以上均不可用时，才考虑额外安装 Python Cassandra driver。
+支持直接指定 `--cassandra-home`，也支持设置为 cqlsh.py 路径或 Cassandra 的 lib 目录。脚本打印实际加载的 driver 路径、版本、reactor、路由策略和协议版本。Python 要与该 cqlsh bundle 兼容，不是任意旧 bundle 都支持任意新版 Python。
 
-自动发现逻辑与 Cassandra 3.11 `cqlsh.py` 一致：从 `lib/` 加载
-`cassandra-driver-internal-only-*.zip`，同时复用其中的 `futures-*.zip` 和
-`six-*.zip`。可对照
-[Apache Cassandra 3.11 cqlsh.py](https://github.com/apache/cassandra/blob/cassandra-3.11/bin/cqlsh.py)。
-脚本不直接依赖 PyYAML、requests、numpy、pandas、gevent 或其他第三方库。
+已实测 Python 2.7.18、Python 3.12.13，以及 Cassandra 3.11.19 附带的 driver 3.11.0.post0。Python 2 已停止维护，应限于隔离遗留环境。
 
-支持 Python 2.7 和 Python 3。Python 2.7 已停止维护，只应在遗留、隔离的测试环境
-使用；生产或长期压测优先使用 Python 3。确实没有 cqlsh bundle 时，Python 2.7 可
-使用 `cassandra-driver==3.25.0`；Python 3 应选择与本机 Python/Cassandra 版本兼容的
-driver。该安装属于最后兜底，不是默认步骤。
+## 并发和数量的含义
 
-先修改 `/tmp/vehicle-load.json`：
+| 设置 | 含义 |
+| --- | --- |
+| processes | 独立写进程数；示例为 4 |
+| producer_threads | 每个进程的 producer 线程数；建议 1 |
+| concurrency | 所有进程合计的最大未回收请求数，不是每进程数量 |
+| batch_size | 一个 UNLOGGED BATCH 的行数；async/sync 忽略此设置 |
+| total_rows / --rows | 所有进程合计的成功写入目标，0 表示不按行数停止 |
+| duration_seconds / --duration | 统一开始发压后的时长；0 表示不按时长停止 |
+| rate_limit_rows_per_second / --rate | 所有进程合计的行/秒上限，不是吞吐保证 |
+| vehicle_count | 所有进程合计的车辆数；各进程负责不重叠车辆编号范围 |
+| verification.sample_size | 全部进程合计的回读样本数 |
+| sessions | 每进程 Session 数，默认 1；多个 Session 轮流接收请求 |
 
-- `contact_points`、端口和 `local_dc`；
-- 通常保持 `cassandra_home` 为空并使用环境变量；也可填写 Cassandra 安装根目录；
-- `sessions` 默认 1；protocol v3+ 下每个 Session 会为每个本地节点建立一条连接，
-  可用 2 或 4 做受控对比；
-- keyspace、table、建表 CQL 与列；
-- `partition_key_columns` 必须与真实表分区键一致；batch 模式据此执行安全校验；
-- 示例按隔离的三节点测试集群使用 `SimpleStrategy/rf=3`；正式拓扑应改成
-  `NetworkTopologyStrategy` 和真实 DC 名称；
-- 若集群启用认证，把 `username_env/password_env` 改为环境变量名，例如
-  `CASS_USERNAME`/`CASS_PASSWORD`，凭据本身不要写入 JSON；
-- 已有表可将两个 `create_*_if_missing` 设为 `false`；
-- `Z06_CHS` 是非标准 Cassandra CQL 扩展，不适用于原生 Apache Cassandra。请按
-  目标 Cassandra 分支的真实表参数校准。
+concurrency、行数、车辆和限速被分配给各进程，余数也计入分配。进程数不超过 concurrency、vehicle_count 和非零行数目标，因此很小的任务可能实际少开进程。低速限流允许启动时少量进程级突发，不是严格逐毫秒匀速。
 
-示例表保持 CHS 场景的关键布局：分区键是车辆 ID，第一聚簇列是秒级业务时间。
-默认 `temperature_source=write_timestamp`，所以建表 CQL 不设置 `chs_column`，
-`event_time_s` 只是业务时间列。`sample_seq` 保证高压下主键仍唯一，不会把重复
-INSERT 变成覆盖写。示例默认 `ttl_seconds=null`，不会产生 TTL 数据。
+示例默认：4 进程，每进程 1 producer，全局 80 个 batch，每批 8 行，最多约 640 行未完成。一个进程加很多 Python 线程可能更慢；不要把 producer_threads 当成请求并发。
 
-## 2. 先检查，再小流量冒烟
+### 常用命令
 
 ```bash
-python cassandra_vehicle_timeseries_load.py \
-  --config /tmp/vehicle-load.json --check-config
+# 单行异步基线；写够 1000 万行
+python -u cassandra_vehicle_timeseries_load.py --config example-config.json \
+  --write-mode async --processes 4 --producer-threads 1 \
+  --concurrency 256 --rows 10m --duration 0
 
-python cassandra_vehicle_timeseries_load.py \
-  --config /tmp/vehicle-load.json --dry-run 12
-
-python cassandra_vehicle_timeseries_load.py \
-  --config /tmp/vehicle-load.json --producer-threads 2 \
-  --concurrency 4 --rows 1000 --rate 200
-```
-
-小流量写入和抽样回读通过后再升压。
-
-## 3. 按数据量或时长运行
-
-### 3.1 写入模式
-
-| `write_mode` | `concurrency` 含义 | 用途 |
-| --- | --- | --- |
-| `async` | 全局最大 native-protocol in-flight 请求数 | 单行 prepared statement + `execute_async` + completion queue，用作基线和通用模式 |
-| `unlogged_batch` | 最大 in-flight batch 请求数 | 示例默认；每个 batch 只包含同一 `vehicle_id` 分区，减少网络往返 |
-| `sync` | 同步写线程数 | 兼容和问题定位；不是高吞吐默认值 |
-
-`producer_threads` 只是生成数据、提交异步请求的少量 Python 线程，不应等同于
-`concurrency`。每个 future 完成后直接进入 completion queue，哪个先完成就先回收并
-立即补位，不会按提交顺序等待慢请求。示例默认是 8 个 producer、80 个 batch
-in-flight、每批 8 行，即最多约 640 行未完成。
-
-写满 1000 万行，使用异步 pipeline：
-
-```bash
-python cassandra_vehicle_timeseries_load.py \
-  --config /tmp/vehicle-load.json \
-  --write-mode async --producer-threads 8 --concurrency 256 --rows 10m
-```
-
-持续 30 分钟，最多 512 个异步请求，限速 5 万行/秒：
-
-```bash
-python cassandra_vehicle_timeseries_load.py \
-  --config /tmp/vehicle-load.json \
-  --write-mode async --producer-threads 8 --concurrency 512 --rows 0 \
-  --duration 30m --rate 50000 --summary-json /tmp/vehicle-load-summary.json
-```
-
-同一车辆分区内每批 8 行的 UNLOGGED BATCH：
-
-```bash
-python cassandra_vehicle_timeseries_load.py \
-  --config /tmp/vehicle-load.json \
+# 同分区小 batch；持续 30 分钟
+python -u cassandra_vehicle_timeseries_load.py --config example-config.json \
   --write-mode unlogged_batch --batch-size 8 \
-  --producer-threads 8 --concurrency 64 --rows 10m
+  --processes 4 --producer-threads 1 --concurrency 80 \
+  --rows 0 --duration 30m --summary-json vehicle-load-summary.json
 ```
 
-如需判断 protocol v3+ 的单连接是否成为瓶颈，在其他参数不变时仅增加
-`--sessions 2` 做 A/B；不要同时修改 batch、sessions 和 concurrency，否则无法归因。
+行数、时长都大于 0 时，先到的条件停止提交新数据；之后排空已提交请求，因此实际进程退出可以晚于 duration。drain_timeout_seconds 限制停止后的排空等待。
 
-这里的 64 是 batch 请求数；每批 8 行时，最多约 512 行处于未完成状态。脚本要求
-`partition_key_columns` 只能使用 `vehicle_id` 或常量生成器，并再次按生成后的
-`vehicle_id` 分组。建议从
-`batch_size=8` 开始，只比较 1、4、8、16 等小档位，并关注 Cassandra 的
-`batch_size_warn_threshold_in_kb`。Batch 不是越大越快，也不应用于跨车辆分区聚合。
+max_batch_bytes 默认 16 KiB，限制 batch 编码体的保守估算大小。每一批检查真实 prepared routing key，跨分区或超限会报错，不会默默发送。batch 不是越大越好；对比 4/8/16 时同时记录请求数、行数和时延。sync 模式仅用于兼容/定位。
 
-如果行数和时长都大于 0，任一限制先到即停止。行数指成功写入量；瞬时失败会按配置
-重试。最终仍有失败或抽样回读缺失时，脚本退出码为 1。
+sync 使用同步线程，线程总数由 concurrency 决定，忽略 producer_threads；上述“每进程 1 producer”的建议适用于 async/batch。
 
-### 3.2 三节点 16U64G 建议起点
-
-配置中的 `contact_points` 应包含三个节点，并填写实际 `local_dc`。设置 `local_dc` 时，
-脚本使用 `TokenAwarePolicy(DCAwareRoundRobinPolicy)`；prepared statement 的 routing
-key 会帮助请求优先发往对应副本。
-
-运行前先用 `DESCRIBE KEYSPACE chs_load_test` 或系统表核对 RF。示例使用
-`CREATE KEYSPACE IF NOT EXISTS`，如果 keyspace 已存在，修改 JSON 不会自动改变旧 RF；
-需要由测试 DBA 显式调整或重建测试 keyspace。
-
-建议依次测试并记录每档稳定 5–10 分钟的 rows/s、requests/s、P95/P99：
-
-1. `async`: in-flight 128、256、512、1024；
-2. 单行写的 in-flight 已满但服务端 CPU 仍低时，对比 `--sessions 1/2/4`；每增加一个
-   Session 都会增加每节点连接数，不要无上限增加；
-3. 如果单请求网络开销明显，再测同分区 batch 4、8、16；
-4. 如果压测机单进程 CPU 已满但集群仍有余量，再启动多个进程，每个进程使用不同
-   `--vehicle-id-prefix`，避免写成同一批主键。
-
-压测机最好与 Cassandra 节点分离，同时观察压测机 CPU。如果客户端单核先到 100%，
-这不是 Cassandra 容量上限，应使用多进程档位；如果客户端仍有余量而服务端磁盘或
-compaction 已饱和，则应降低并发。
-
-不要以“Cassandra CPU 必须跑满”作为唯一目标。如果 rows/s 已不再增长而 P95/P99、
-pending compaction、磁盘利用率或网络已经上升，继续加 in-flight 只会扩大排队。
-
-## 4. 前台、nohup 与进度日志
-
-前台运行：
-
-```bash
-export CASSANDRA_HOME=/path/to/cassandra
-python -u cassandra_vehicle_timeseries_load.py \
-  --config example-config.json
-```
-
-推荐的 nohup 运行方式：
+## nohup、进度与停止
 
 ```bash
 export CASSANDRA_HOME=/path/to/cassandra
 nohup python -u cassandra_vehicle_timeseries_load.py \
   --config example-config.json \
+  --processes 4 --producer-threads 1 \
+  --write-mode unlogged_batch --batch-size 8 --concurrency 80 \
+  --rows 0 --duration 24h --summary-json vehicle-load-summary.json \
   > vehicle-load.log 2>&1 &
-
 echo $! > vehicle-load.pid
-```
 
-按时长后台压测：
-
-```bash
-nohup python -u cassandra_vehicle_timeseries_load.py \
-  --config example-config.json \
-  --write-mode async --producer-threads 8 --concurrency 512 \
-  --rows 0 --duration 24h \
-  > vehicle-load.log 2>&1 &
-```
-
-如果一个压测进程先成为瓶颈，可启动多个独立进程；每个进程必须使用不同车辆前缀：
-
-```bash
-for client in 1 2 3 4; do
-  nohup python -u cassandra_vehicle_timeseries_load.py \
-    --config example-config.json \
-    --write-mode async --producer-threads 8 --concurrency 256 \
-    --vehicle-id-prefix "load${client}-vehicle-" \
-    --rows 0 --duration 24h \
-    > "vehicle-load-${client}.log" 2>&1 &
-done
-```
-
-查看进度和进程：
-
-```bash
 tail -f vehicle-load.log
-ps -fp "$(cat vehicle-load.pid)"
+
+# 给父进程 SIGTERM：停止提交，排空请求，输出 INTERRUPTED 汇总
+kill -TERM "$(cat vehicle-load.pid)"
 ```
 
-`workload.progress_interval_seconds` 默认每 5 秒输出一次并立即 flush；设为 `0` 可关闭。
-日志包含 UTC 时间、模式、batch 大小、已成功行数/目标、请求/行 in-flight、两种吞吐、
-请求 P95、压测进程 CPU 和各 coordinator 累计请求数，例如：
+父进程输出全局统计并立即 flush，子进程启动时会输出自身连接诊断。不要直接 kill -9 正常停止压测；强制杀死 worker 会使本轮失败，无法确认的写入不能计为成功。
 
-```text
->>> progress utc=2026-09-04T01:23:45Z elapsed=30.0s mode=async batch=1 rows=150000/1000000 (15.0%) failed=0 inflight_req=256 inflight_rows=256 row_rate=5000.0/s req_rate=5000.0/s p95=8.200ms client_cpu=72.0% coordinators=10.0.0.1:9042=50120,10.0.0.2:9042=49931,10.0.0.3:9042=49949
-```
+progress 字段：
 
-正常完成后，日志末尾会输出完整 JSON 汇总和 `PASS:`；写入或抽样回读失败则输出
-`FAIL:` 并返回非零退出码。`python -u` 与脚本的显式 flush 可以确保重定向日志及时
-可见。
+- row_rate、req_rate、encoded_MBps：相邻两次全局报告的增量速率。各 worker 最新快照可能相差约 1 秒，短报告间隔和起始阶段会有明显波动；最终汇总使用全部 worker 的最终计数。
+- avg_row_rate：从统一发压开始计算的累计成功行吞吐。
+- driver_pending：尚未进入应用 callback 的请求；包含 driver 内部等待，不是纯服务端队列或 wire in-flight。
+- completed_queued：callback 已完成、等待 producer 回收的请求。
+- request_errors / retry_attempts / failed：尝试错误、实际应用重试、最终失败行数。
+- p95_all：全程请求时延的抽样 P95；不是最近 5 秒 P95。多进程按请求数加权合并样本，不平均各进程 P95。
+- callback_queue_mean：回调完成后等待应用回收的平均时间。
+- client_cpu_avg：写入进程累计 CPU 使用之和；100% 约为一个逻辑核，四进程可以超过 100%，不含父进程和 Cassandra。
+- coordinators：成功/失败回调所报告的 coordinator 累计请求量；旧 driver 可能不提供。
+- encoded_MBps：绑定值/批体的编码大小估算，不是抓包字节数或磁盘增长速度。
 
-### 4.1 低吞吐快速判断
+请求时延包含绑定、提交和等待 callback；不包含之前的数据生成，也不包含之后的完成队列等待。不要再用 `concurrency / req_rate` 推导数据库独立处理时延。
 
-当 in-flight 长期打满时，可用下面的近似判断请求延迟是否已经锁住吞吐：
+Python 3 优先使用 monotonic 时钟计时；Python 2 无该标准库 API 时回退到系统时钟，运行期间应避免人为跳变时钟，否则时长/速率统计会受影响。
 
-```text
-平均请求延迟（秒）≈ inflight_req / req_rate
-```
+最终 JSON 包含每个进程、全局结果、回读结果和真实 schema 检查结果。PASS 为退出码 0，写入/校验或环境异常非零，正常 SIGTERM/SIGINT 收尾为 INTERRUPTED / 130。
 
-例如 640 个请求、约 2050 req/s，对应平均约 312 ms；这时继续增加 concurrency 通常
-只会加深排队。应优先比较同等 `inflight_rows` 下的 batch、sessions，再检查：
+## 数据身份、温度和数据真实性
 
-```bash
-nodetool status
-nodetool tpstats
-nodetool compactionstats
-nodetool proxyhistograms
-iostat -x 1
-```
+### 防止误覆盖
 
-- `coordinators` 明显只集中在一个地址：检查三个 contact points、`local_dc`、token-aware
-  路由和节点状态；
-- `client_cpu` 接近单进程上限而服务端空闲：增加压测进程，不要继续增加单进程线程；
-- coordinator 分布均匀、客户端 CPU 不高、服务端 CPU 也低但 P95 很高：重点检查
-  commitlog fsync、磁盘 await/util、RocksDB write stall、pending compaction、GC 和网络；
-- batch 后 req/s 相近但 rows/s 按 batch 倍数增长：瓶颈主要是单请求往返；
-- batch 后请求延迟或服务端 pending 急剧上升：缩小 batch 或 concurrency。
+run_id 默认 auto，每轮给车辆前缀增加唯一运行标识；所有 worker 使用同一个运行标识，但车辆范围不重叠。每轮仍只生成 vehicle_count 辆车；同表多轮运行会保留不同运行标识的历史车辆 ID。
 
-## 5. 温度来源与业务时间构造
+`--run-id my-run` 可指定标识；`--run-id ''` 可用于刻意重放。重复固定 run_id、固定时间窗口和序列，会覆盖已有主键，此时成功 INSERT 数不等于新增行数。默认主键包含 vehicle_id、时间、timeline、sample_seq；修改 schema 时必须自行保持完整主键唯一性。
 
-这两个概念必须分开：
-
-- `schema.temperature_source` 决定 CHS 真正使用哪个温度来源；
-- `workload.event_time_mode` 只决定脚本如何生成 `event_time_s` 等业务时间列。
-
-### 5.1 Cassandra write timestamp 作为温度（默认）
+### write_timestamp 温度
 
 ```json
 "temperature_source": "write_timestamp",
 "temperature_column": ""
 ```
 
-对应建表属性不设置 `chs_column`：
+建表不指定 chs_column，例：
 
 ```sql
 AND Z06_CHS = {'chs_time':'3600','time_unit':'s'}
 ```
 
-脚本不使用 `USING TIMESTAMP` 回填历史 mutation timestamp。CHS 按 Cassandra 正常
-写入 timestamp 判温，新写入数据先热，超过 `chs_time` 后自然变冷。此时
-`event_time_s` 仍会记录业务事件时间，但它不参与 CHS 判温。
+业务时间模式使用 natural_write_time。不回填历史 mutation timestamp。已测试 driver 在 protocol v3+ 默认通过协议携带客户端 timestamp，因此该模式也需要压测机/数据库时钟同步；未写 USING TIMESTAMP 不等于必定采用服务端时钟。
 
-该温度来源必须配合自然业务时间模式：
-
-```json
-"event_time_mode": "natural_write_time"
-```
-
-```bash
-python cassandra_vehicle_timeseries_load.py \
-  --config /tmp/vehicle-load.json --event-time-mode natural_write_time \
-  --duration 30m --rows 0
-```
-
-### 5.2 自定义 CK 列作为温度
-
-如果要让 `event_time_s` 控制温度，配置必须改为：
+### 自定义 CK 温度
 
 ```json
 "temperature_source": "custom_ck",
 "temperature_column": "event_time_s"
 ```
 
-同时在建表属性中明确指定同一个 CK 列：
+建表必须指定：
 
 ```sql
-AND Z06_CHS = {
-  'chs_column':'event_time_s',
-  'chs_time':'3600',
-  'time_unit':'s'
-}
+AND Z06_CHS = {'chs_column':'event_time_s','chs_time':'3600','time_unit':'s'}
 ```
 
-脚本会校验 `temperature_column` 存在于写入列中、使用时间生成器，并与建表 CQL 的
-`chs_column` 一致。
+可使用自然时间，也可使用 weighted_time_windows。窗口设置由 time_windows 的偏移、weight 和 timeline.interval_seconds 控制：
 
-自定义 CK 来源可以选择两种业务时间构造方式：
+- window_anchor=fixed：固定启动参考时间或 reference_time_utc，适合历史回放；hot 标签会随真实时间推进而老化，不能当作实时热数据比例。
+- window_anchor=rolling：每行根据当前时间平移 age 窗口，适合持续构造冷热年龄分布。
+- window_sampling=sequential：从窗口起点按 timeline 间隔递进、到末尾回绕。短跑可能只覆盖窗口起点。
+- window_sampling=uniform：在窗口内分布采样，用于覆盖时间范围。
 
-- `natural_write_time`：在 payload 等其他列生成完毕后、真正发起 INSERT 前读取本机
-  wall clock，写入 `event_time_s`；
-- `weighted_time_windows`：按配置快速构造历史冷窗口和近期热窗口。
+启动检查真实分区键、完整验证主键、CK 属性。若实例暴露 Z06_CHS 元数据，还会核对配置值；否则输出 chs_metadata=not_exposed，不伪称验证成功。需要严格拒绝未知状态时设置 require_chs_metadata=true。普通 Cassandra 测试应保持 false。
 
-窗口模式下，示例预置：
+CREATE IF NOT EXISTS 不会 ALTER 已有表。改变温度来源或表结构前，应由测试人员确认真实表；脚本不会自动 ALTER、DROP 或 DELETE。只有 truncate_before_load=true 且传入 --allow-destructive 才会 TRUNCATE，并在 prepare/schema 检查通过后执行。
 
-- `cold`：启动前 7 天到前 1 天，`weight=4`；
-- `hot`：启动前 5 分钟到启动时刻，`weight=1`。
+### payload 和长压分区
 
-因此约 80% 行落在冷时间窗、20% 落在热时间窗。到窗口末端后从窗口开头继续，长压
-时不会让冷时间漂入热窗口。使用窗口模式前，需要按上面的方式修改
-`temperature_source`、`temperature_column` 和 `table_cql`，然后运行：
+random_blob 默认 mode=pooled、pool_size=256，复用有限随机字节池，降低客户端成本。需要低重复度数据可将该列设为 mode=unique；生成成本和压缩效果会不同。比较版本性能时必须保持此设置一致。
+
+车辆分区持续增长，没有自动时间分桶。设置 vehicle_count、行宽和持续时长时应考虑目标分区密度，不能把短跑结果当作长期 compaction/冷热迁移能力。
+
+## 重试与回读
+
+默认 max_retries=0，避免掩盖压测错误。driver 使用 FallthroughRetryPolicy；协议级 UNPREPARED 等内部恢复不等于应用重试。
+
+async/batch 模式显式打开 max_retries 时，仅对选定的临时 driver 错误使用退避队列，不暂停其他请求回收。sync 保留阻塞重试，只适合定位问题。超时可能已经写入成功，重试会重新生成正常 mutation timestamp；对首写温度敏感的测试应保持 0。TTL 写入要求 max_retries=0，以免重试延长过期时间。
+
+回读保存全程 reservoir 样本，比较配置中的所有写入列，不只检查主键存在。短 TTL 可能在回读前正常到期；不要把此模式用于不区分到期原因的数据一致性验收。LOCAL_ONE 写后 LOCAL_ONE 读也不是所有副本一致性的证明。
+
+CQL timestamp 回读按 Cassandra 的毫秒精度比较，不能要求保留 Python datetime 的微秒精度。
+
+## 自测与性能验证
 
 ```bash
-python cassandra_vehicle_timeseries_load.py \
-  --config /tmp/vehicle-load.json \
-  --event-time-mode weighted_time_windows --rows 1m
+python2.7 -S cassandra_vehicle_timeseries_load.py --config example-config.json --self-test
+python3 -S cassandra_vehicle_timeseries_load.py --config example-config.json --self-test
 ```
 
-自定义 CK 的自然模式依赖压测机与 Cassandra 节点时钟同步，应先检查 NTP/chrony。
-无论使用哪种来源，时间超过阈值都不等于 SST 已经入冷；仍需按目标版本流程执行或
-等待 flush、compact、separate 和 move，并用集群指标验证。
+内置自测使用固定 fixture，不受用户自定义列和窗口名影响。它不连接 Cassandra，不能证明真实吞吐。
 
-## 6. 列生成器
+实际普通 Cassandra 对照见 [本地性能与回归报告](BENCHMARK.md)。建议内部按 1/2/4/8 进程做扩展曲线，先保持全局 concurrency、车辆数、RF、CL、行宽、payload 模式不变，再单独调整 concurrency 和 batch。同时观察压测机 CPU、数据库 CPU、磁盘、commitlog、compaction、GC 和网络，不能以“数据库 CPU 必须满”为唯一目标。
 
-每个 `schema.columns[]` 由 `name` 和 `generator` 定义。支持：
-
-- 身份/时间：`vehicle_id`、`timeline`、`time_window`、`event_time_seconds`、
-  `event_time_millis`、`event_time_timestamp`、`event_date`、`sequence`、
-  `stream_sequence`；
-- 通用值：`random_int`、`random_float`、`choice`、`constant`、
-  `linear_float`、`random_blob`、`random_text`、`boolean`。
-
-配置检查会拒绝生成 `null` 的规则，避免 INSERT 在测试表中意外制造 tombstone。
-`random_blob.pool_size` 默认 256：脚本用 SHA-256 预生成并复用有限 payload 池，避免
-Python 为每一行逐字节调用随机数成为客户端瓶颈；`size * pool_size` 上限为 64 MiB。
-
-## 7. 内置自测
-
-自测不需要 Cassandra driver 或 Cassandra 集群：
-
-```bash
-python2.7 -S cassandra_vehicle_timeseries_load.py \
-  --config example-config.json --self-test
-
-python3 -S cassandra_vehicle_timeseries_load.py \
-  --config example-config.json --self-test
-```
-
-真实 Cassandra 连通、DDL 扩展和 CHS 入冷必须在目标隔离集群上验证。
-
-## 8. 实现参考与 Batch 边界
-
-本工具的吞吐模型参考了以下公开实现：
-
-- [Cassandra 3.11 cqlsh COPY](https://github.com/apache/cassandra/blob/cassandra-3.11/pylib/cqlshlib/copyutil.py)：多进程转换、prepared UNLOGGED BATCH、
-  `execute_async` callback、in-flight 上限和失败重试；
-- [cassandra-stress StressAction](https://github.com/apache/cassandra/blob/cassandra-3.11/tools/stress/src/org/apache/cassandra/stress/StressAction.java)：
-  独立控制线程、速率和指标；
-- [YCSB CassandraCQLClient](https://github.com/brianfrankcooper/YCSB/blob/master/cassandra/src/main/java/site/ycsb/db/CassandraCQLClient.java)：
-  多线程共享 cluster/session，并缓存 prepared statements；
-- [DataStax Python driver concurrent API](https://github.com/datastax/python-driver/blob/master/docs/api/cassandra/concurrent.rst)：
-  使用受控 concurrency，而不是无限制造同步线程；
-- [Apache Cassandra CQL BATCH](https://cassandra.apache.org/doc/latest/cassandra/developing/cql/dml.html#batch-statement)：
-  Batch 可减少网络往返，但跨分区原子 batch 有额外成本。
-
-因此，本脚本默认使用异步单行写；可选 batch 严格按 `vehicle_id` 分组并使用
-`UNLOGGED BATCH`。没有使用跨 partition key 的 logged batch，也没有调用 Python
-driver 的私有批量编码字段。
+设计参考：[Python driver 性能说明](https://python-driver.readthedocs.io/en/stable/performance.html)、[Cassandra 3.11 COPY](https://github.com/apache/cassandra/blob/cassandra-3.11/pylib/cqlshlib/copyutil.py)。本工具使用公共 prepared/batch API，没有复制 driver 私有批量编码实现。

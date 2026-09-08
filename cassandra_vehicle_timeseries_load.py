@@ -12,16 +12,20 @@ import calendar
 import copy
 import glob
 import hashlib
+import heapq
 import io
 import json
 import math
+import multiprocessing
 import os
 import random
 import re
 import ssl
+import signal
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import date, datetime, timedelta, tzinfo
 
@@ -73,6 +77,7 @@ class _FixedOffsetTimezone(tzinfo):
 
 UTC_TZ = _UtcTimezone()
 MONOTONIC_TIME = getattr(time, "monotonic", time.time)
+VERSION = "2.0.0"
 
 
 def _utc_now():
@@ -146,7 +151,7 @@ GENERATOR_KEYS = {
     "choice": {"values"},
     "constant": {"value"},
     "linear_float": {"base", "step", "vehicle_step", "decimals"},
-    "random_blob": {"size", "pool_size"},
+    "random_blob": {"size", "pool_size", "mode"},
     "random_text": {"size", "alphabet"},
     "boolean": {"true_probability"},
 }
@@ -417,6 +422,7 @@ def validate_config(raw_config):
             "temperature_source",
             "temperature_column",
             "partition_key_columns",
+            "require_chs_metadata",
             "truncate_before_load",
             "columns",
         },
@@ -424,6 +430,9 @@ def validate_config(raw_config):
     )
     _validate_identifier(schema.get("keyspace"), "schema.keyspace")
     _validate_identifier(schema.get("table"), "schema.table")
+    _require_bool(
+        schema.setdefault("require_chs_metadata", False), "schema.require_chs_metadata"
+    )
     _require_bool(
         schema.setdefault("create_keyspace_if_missing", False),
         "schema.create_keyspace_if_missing",
@@ -575,6 +584,12 @@ def validate_config(raw_config):
             "progress_interval_seconds",
             "random_seed",
             "latency_sample_size",
+            "processes",
+            "run_id",
+            "max_batch_bytes",
+            "drain_timeout_seconds",
+            "window_anchor",
+            "window_sampling",
         },
         "workload",
     )
@@ -600,7 +615,7 @@ def validate_config(raw_config):
         workload.setdefault("concurrency", 256), "workload.concurrency", 1
     )
     producer_threads = _require_int(
-        workload.setdefault("producer_threads", 8),
+        workload.setdefault("producer_threads", 1),
         "workload.producer_threads",
         1,
     )
@@ -613,6 +628,28 @@ def validate_config(raw_config):
     )
     if batch_size > 128:
         raise ConfigError("workload.batch_size must be <= 128")
+    _require_int(workload.setdefault("processes", 1), "workload.processes", 1)
+    if workload["processes"] > 64:
+        raise ConfigError("workload.processes must be <= 64")
+    _require_int(
+        workload.setdefault("max_batch_bytes", 16384), "workload.max_batch_bytes", 256
+    )
+    _require_number(
+        workload.setdefault("drain_timeout_seconds", 60),
+        "workload.drain_timeout_seconds",
+        1,
+    )
+    run_id = workload.setdefault("run_id", "auto")
+    _require_string(run_id, "workload.run_id", allow_empty=True)
+    if run_id and not _fullmatch(r"[A-Za-z0-9_-]+", run_id):
+        raise ConfigError("run_id must contain only letters, numbers, _ or -")
+    if workload.setdefault("window_anchor", "fixed") not in {"fixed", "rolling"}:
+        raise ConfigError("window_anchor must be fixed or rolling")
+    if workload.setdefault("window_sampling", "sequential") not in {
+        "sequential",
+        "uniform",
+    }:
+        raise ConfigError("window_sampling must be sequential or uniform")
     _require_int(workload.setdefault("total_rows", 0), "workload.total_rows", 0)
     _require_number(
         workload.setdefault("duration_seconds", 0), "workload.duration_seconds", 0
@@ -674,7 +711,11 @@ def validate_config(raw_config):
         raise ConfigError(
             "unsupported workload.consistency_level: {}".format(consistency)
         )
-    _require_int(workload.setdefault("max_retries", 2), "workload.max_retries", 0)
+    _require_int(workload.setdefault("max_retries", 0), "workload.max_retries", 0)
+    if workload["ttl_seconds"] is not None and workload["max_retries"]:
+        raise ConfigError(
+            "TTL loads require max_retries=0 to avoid extending expiry on retries"
+        )
     _require_number(
         workload.setdefault("retry_backoff_seconds", 0.05),
         "workload.retry_backoff_seconds",
@@ -826,6 +867,8 @@ def _validate_column_generator(column, path):
         if size > 16 * 1024 * 1024:
             raise ConfigError("{}.size must be <= 16777216".format(path))
         if generator == "random_blob":
+            if column.setdefault("mode", "pooled") not in {"pooled", "unique"}:
+                raise ConfigError("{}.mode must be pooled or unique".format(path))
             pool_size = _require_int(
                 column.get("pool_size", 256), "{}.pool_size".format(path), 1
             )
@@ -850,6 +893,10 @@ def apply_overrides(config, args):
         result["connection"]["cassandra_home"] = args.cassandra_home
     if args.sessions is not None:
         result["connection"]["sessions"] = args.sessions
+    if getattr(args, "processes", None) is not None:
+        workload["processes"] = args.processes
+    if getattr(args, "run_id", None) is not None:
+        workload["run_id"] = args.run_id
     if args.write_mode is not None:
         workload["write_mode"] = args.write_mode
     if args.concurrency is not None:
@@ -899,7 +946,9 @@ def build_insert_cql(config):
 
 def build_verify_cql(config):
     keys = config["verification"]["key_columns"]
-    selected = ", ".join(quote_identifier(name) for name in keys)
+    selected = ", ".join(
+        quote_identifier(col["name"]) for col in config["schema"]["columns"]
+    )
     predicates = " AND ".join("{} = ?".format(quote_identifier(name)) for name in keys)
     return "SELECT {} FROM {} WHERE {} LIMIT 1".format(
         selected, qualified_table(config), predicates
@@ -934,7 +983,7 @@ class RowContext:
 class VehicleRowGenerator:
     """Generate deterministic rows from a global sequence number."""
 
-    def __init__(self, config, now_utc=None):
+    def __init__(self, config, now_utc=None, vehicle_offset=0):
         self.config = config
         workload = config["workload"]
         if workload["reference_time_utc"] is not None:
@@ -960,12 +1009,17 @@ class VehicleRowGenerator:
         self.rows_per_vehicle = self.timeline_count * self.window_slot_count
         self.stream_count = self.vehicle_count * self.rows_per_vehicle
         self.seed = workload["random_seed"]
+        self.vehicle_offset = vehicle_offset
+        self.column_names = [c["name"] for c in config["schema"]["columns"]]
+        self.local = threading.local()
         self.jitter_seconds = float(workload["timestamp_jitter_seconds"])
         self.blob_cache = {}
         self.blob_cache_lock = threading.Lock()
 
     def context(self, index, now_epoch_seconds=None):
-        vehicle_index = (index // self.rows_per_vehicle) % self.vehicle_count
+        vehicle_index = (
+            index // self.rows_per_vehicle
+        ) % self.vehicle_count + self.vehicle_offset
         within_vehicle = index % self.rows_per_vehicle
         window_slot = within_vehicle // self.timeline_count
         timeline_index = within_vehicle % self.timeline_count
@@ -985,12 +1039,15 @@ class VehicleRowGenerator:
         window_index, window_occurrence = self.window_schedule[window_slot]
         window = self.time_windows[window_index]
         stream_sequence = logical_cycle * window["weight"] + window_occurrence
-        window_start = self.reference_epoch_seconds + float(
-            window["start_offset_seconds"]
-        )
-        window_end = self.reference_epoch_seconds + float(window["end_offset_seconds"])
+        anchor = self.reference_epoch_seconds
+        if self.config["workload"]["window_anchor"] == "rolling":
+            anchor = time.time() if now_epoch_seconds is None else now_epoch_seconds
+        window_start = anchor + float(window["start_offset_seconds"])
+        window_end = anchor + float(window["end_offset_seconds"])
         window_span = window_end - window_start
         progression = stream_sequence * float(timeline["interval_seconds"])
+        if self.config["workload"]["window_sampling"] == "uniform":
+            progression = (self._row_seed(index) / 4294967296.0) * window_span
         if window_span > 0:
             progression %= window_span
         else:
@@ -1030,7 +1087,10 @@ class VehicleRowGenerator:
         if self.event_time_mode == "natural_write_time" and context_now is None:
             context_now = 0.0
         context = self.context(index, now_epoch_seconds=context_now)
-        rng = random.Random(self._row_seed(index))
+        rng = getattr(self.local, "rng", None)
+        if rng is None:
+            rng = self.local.rng = random.Random(0)
+        rng.seed(self._row_seed(index))
         result = {}
         for column in self.config["schema"]["columns"]:
             result[column["name"]] = self._generate_value(column, context, rng)
@@ -1050,7 +1110,7 @@ class VehicleRowGenerator:
         return result
 
     def bind_values(self, row):
-        values = [row[column["name"]] for column in self.config["schema"]["columns"]]
+        values = [row[name] for name in self.column_names]
         ttl_seconds = self.config["workload"]["ttl_seconds"]
         if ttl_seconds is not None:
             values.append(ttl_seconds)
@@ -1063,6 +1123,15 @@ class VehicleRowGenerator:
 
     def _pooled_random_blob(self, column, context):
         size = column["size"]
+        if column.get("mode", "pooled") == "unique":
+            seed = "{}:{}:{}:{}".format(
+                self.seed, column["name"], context.vehicle_index, context.index
+            ).encode("ascii")
+            blocks = [
+                hashlib.sha256(seed + b":" + str(i).encode("ascii")).digest()
+                for i in ITER_RANGE((size + 31) // 32)
+            ]
+            return bytearray(b"".join(blocks)[:size])
         pool_size = column.get("pool_size", 256)
         slot = context.index % pool_size
         cache_key = (column["name"], size, slot)
@@ -1147,7 +1216,9 @@ class LoadController:
         self.rate_limit = float(workload["rate_limit_rows_per_second"])
         self.max_errors = workload["max_errors"]
         self.max_latency_samples = workload["latency_sample_size"]
-        self.verification_sample_size = verification["sample_size"]
+        self.verification_sample_size = (
+            verification["sample_size"] if verification["enabled"] else 0
+        )
         self.verification_keys = verification["key_columns"]
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -1160,6 +1231,14 @@ class LoadController:
         self.request_attempts = 0
         self.request_errors = 0
         self.requests_in_flight = 0
+        self.completion_queued = 0
+        self.latency_total = 0.0
+        self.latency_max = 0.0
+        self.queue_delay_total = 0.0
+        self.retry_attempts = 0
+        self.encoded_bytes = 0
+        self.external_stop = None
+        self.last_progress = None
         self.coordinator_requests = {}
         self.latency_seen = 0
         self.latency_samples = []
@@ -1180,6 +1259,8 @@ class LoadController:
 
     def claim_many(self, max_count, stay_within_group=False):
         with self.lock:
+            if self.external_stop is not None and self.external_stop.is_set():
+                self._stop_locked("interrupted")
             if self.stop_event.is_set():
                 return []
             if self.deadline is not None and MONOTONIC_TIME() >= self.deadline:
@@ -1228,9 +1309,22 @@ class LoadController:
         with self.lock:
             self.requests_in_flight += 1
 
-    def record_request(self, latency_ms, failed, coordinator=None):
+    def callback_received(self):
         with self.lock:
             self.requests_in_flight -= 1
+            self.completion_queued += 1
+
+    def record_request(
+        self, latency_ms, failed, coordinator=None, from_queue=False, queue_delay_ms=0
+    ):
+        with self.lock:
+            if from_queue:
+                self.completion_queued -= 1
+            else:
+                self.requests_in_flight -= 1
+            self.latency_total += latency_ms
+            self.latency_max = max(self.latency_max, latency_ms)
+            self.queue_delay_total += queue_delay_ms
             self.request_attempts += 1
             if failed:
                 self.request_errors += 1
@@ -1253,10 +1347,17 @@ class LoadController:
         with self.lock:
             self.in_flight -= len(rows)
             self.succeeded += len(rows)
-            for row in rows:
-                self.verify_rows.append(
-                    {name: row[name] for name in self.verification_keys}
-                )
+            if self.verification_sample_size:
+                for offset, row in enumerate(rows):
+                    # Full-row reservoir; keep stable copies, not a tail-only sample.
+                    if len(self.verify_rows) < self.verification_sample_size:
+                        self.verify_rows.append(dict(row))
+                    else:
+                        slot = self.latency_rng.randrange(
+                            self.succeeded - len(rows) + offset + 1
+                        )
+                        if slot < self.verification_sample_size:
+                            self.verify_rows[slot] = dict(row)
             if self.total_rows > 0 and self.succeeded >= self.total_rows:
                 self._stop_locked("rows")
 
@@ -1300,6 +1401,11 @@ class LoadController:
                 "request_attempts": self.request_attempts,
                 "request_errors": self.request_errors,
                 "requests_in_flight": self.requests_in_flight,
+                "completion_queued": self.completion_queued,
+                "retry_attempts": self.retry_attempts,
+                "encoded_bytes": self.encoded_bytes,
+                "queue_delay_ms_mean": self.queue_delay_total
+                / max(1, self.request_attempts),
                 "rows_per_second": self.succeeded / elapsed,
                 "requests_per_second": self.request_attempts / elapsed,
                 "client_cpu_percent": client_cpu_percent,
@@ -1309,7 +1415,8 @@ class LoadController:
                     "p50": _percentile(latencies, 0.50),
                     "p95": _percentile(latencies, 0.95),
                     "p99": _percentile(latencies, 0.99),
-                    "max": latencies[-1] if latencies else 0.0,
+                    "max": self.latency_max,
+                    "mean": self.latency_total / max(1, self.request_attempts),
                 },
                 "stop_reason": self.stop_reason,
                 "errors": list(self.errors),
@@ -1371,7 +1478,7 @@ def _sync_worker(
 
 
 class _AsyncCompletion:
-    def __init__(self, started_at, completed_queue):
+    def __init__(self, started_at, completed_queue, controller):
         self.started_at = started_at
         self.completed_at = None
         self.error = None
@@ -1379,6 +1486,7 @@ class _AsyncCompletion:
         self.future = None
         self.coordinator = None
         self.completed_queue = completed_queue
+        self.controller = controller
 
     def capture_coordinator(self):
         host = getattr(self.future, "coordinator_host", None)
@@ -1397,17 +1505,25 @@ class _AsyncCompletion:
     def on_success(self, _result):
         self.capture_coordinator()
         self.completed_at = MONOTONIC_TIME()
+        self.controller.callback_received()
         self.completed_queue.put(self)
 
     def on_error(self, error):
         self.error = error
         self.capture_coordinator()
         self.completed_at = MONOTONIC_TIME()
+        self.controller.callback_received()
         self.completed_queue.put(self)
 
 
 def _make_async_statement(prepared, config, value_rows):
     if config["workload"]["write_mode"] != "unlogged_batch":
+        if hasattr(prepared, "bind"):
+            statement = prepared.bind(value_rows[0])
+            statement._load_bytes = sum(
+                4 + (len(v) if v is not None else 0) for v in statement.values
+            )
+            return statement, None
         return prepared, value_rows[0]
     from cassandra.query import BatchStatement, BatchType
 
@@ -1415,8 +1531,28 @@ def _make_async_statement(prepared, config, value_rows):
         batch_type=BatchType.UNLOGGED,
         consistency_level=_consistency_value(config["workload"]["consistency_level"]),
     )
+    routing_key = None
+    # Protocol header/options allowance plus each prepared-id/value tuple.
+    # The statement kind, short query-id length and short value count need
+    # five bytes in addition to the query id itself.
+    size = 64
     for values in value_rows:
-        statement.add(prepared, values)
+        bound = prepared.bind(values)
+        key = bound.routing_key
+        if key is None or (routing_key is not None and key != routing_key):
+            raise ConfigError("batch must contain one actual encoded partition key")
+        routing_key = key
+        size += (
+            5
+            + len(prepared.query_id)
+            + sum(4 + (len(v) if v is not None else 0) for v in bound.values)
+        )
+        if size > config["workload"]["max_batch_bytes"]:
+            raise ConfigError(
+                "batch exceeds max_batch_bytes; lower batch_size or payload size"
+            )
+        statement.add(bound)
+    statement._load_bytes = size
     return statement, None
 
 
@@ -1430,17 +1566,21 @@ def _submit_async_request(
     controller,
     completed_queue,
 ):
-    completion = _AsyncCompletion(MONOTONIC_TIME(), completed_queue)
+    if isinstance(session, (list, tuple)):
+        cursor = getattr(controller, "session_cursor", 0)
+        controller.session_cursor = cursor + 1
+        session = session[cursor % len(session)]
+    completion = _AsyncCompletion(MONOTONIC_TIME(), completed_queue, controller)
     request = {
         "rows": rows,
         "value_rows": value_rows,
         "attempt": attempt,
-        "completion": completion,
     }
     completion.request = request
     controller.begin_request()
     try:
         statement, parameters = _make_async_statement(prepared, config, value_rows)
+        controller.encoded_bytes += getattr(statement, "_load_bytes", 0)
         timeout = float(config["connection"]["request_timeout_seconds"])
         if parameters is None:
             future = session.execute_async(statement, timeout=timeout)
@@ -1464,80 +1604,157 @@ def _async_worker(
     workload = config["workload"]
     write_mode = workload["write_mode"]
     rows_per_request = workload["batch_size"] if write_mode == "unlogged_batch" else 1
-    max_attempts = workload["max_retries"] + 1
     completed_queue = queue_module.Queue()
     outstanding = 0
-    exhausted = False
+    retries = []
+    retry_order = 0
+    stopping_at = None
+    completion = None
+    while True:
+        now = MONOTONIC_TIME()
+        if controller.external_stop is not None and controller.external_stop.is_set():
+            controller.request_stop("interrupted")
+        if controller.deadline is not None and now >= controller.deadline:
+            controller.request_stop("duration")
+        stopping = controller.stop_event.is_set()
+        if stopping:
+            if stopping_at is None:
+                stopping_at = now
+            while retries:
+                _, _, request = heapq.heappop(retries)
+                controller.complete_failure_many(
+                    RuntimeError("stopped before retry"), len(request["rows"])
+                )
+            if not outstanding:
+                return
+            if now - stopping_at > workload["drain_timeout_seconds"]:
+                raise RuntimeError(
+                    "drain deadline exceeded; outstanding writes have unknown outcome"
+                )
 
-    while outstanding or not exhausted:
-        while outstanding < request_window and not exhausted:
-            logical_indexes = controller.claim_many(
-                rows_per_request,
-                stay_within_group=(write_mode == "unlogged_batch"),
+        # Harvest before generating or rate-limiting any more work.
+        if completion is None:
+            try:
+                completion = completed_queue.get_nowait()
+            except queue_module.Empty:
+                pass
+        if completion is not None:
+            outstanding -= 1
+            request = completion.request
+            controller.record_request(
+                (completion.completed_at - completion.started_at) * 1000,
+                failed=completion.error is not None,
+                coordinator=completion.coordinator,
+                from_queue=True,
+                queue_delay_ms=(now - completion.completed_at) * 1000,
             )
-            if not logical_indexes:
-                exhausted = True
-                break
-            if not controller.wait_for_rate(logical_indexes[-1]):
-                controller.cancel_claims(len(logical_indexes))
-                exhausted = True
-                break
-            if write_mode == "unlogged_batch":
-                row_indexes = [
-                    generator.same_partition_index(index, workload["batch_size"])
-                    for index in logical_indexes
-                ]
+            error = completion.error
+            completion.future = completion.request = completion.controller = None
+            completion = None
+            if error is None:
+                controller.complete_success_many(request["rows"])
+            elif (
+                not stopping
+                and request["attempt"] <= workload["max_retries"]
+                and _retryable(error)
+            ):
+                retry_order += 1
+                delay = workload["retry_backoff_seconds"] * (
+                    2 ** (request["attempt"] - 1)
+                )
+                heapq.heappush(retries, (now + delay, retry_order, request))
             else:
-                row_indexes = logical_indexes
-            rows = [generator.generate(index) for index in row_indexes]
-            value_rows = [generator.bind_values(row) for row in rows]
+                controller.complete_failure_many(error, len(request["rows"]))
+            continue
+
+        if (
+            not stopping
+            and retries
+            and retries[0][0] <= now
+            and outstanding < request_window
+        ):
+            _, _, request = heapq.heappop(retries)
+            controller.retry_attempts += 1
             _submit_async_request(
                 session,
                 prepared,
                 config,
-                rows,
-                value_rows,
-                attempt=1,
-                controller=controller,
-                completed_queue=completed_queue,
+                request["rows"],
+                request["value_rows"],
+                request["attempt"] + 1,
+                controller,
+                completed_queue,
             )
             outstanding += 1
-
-        if not outstanding:
-            continue
-        completion = completed_queue.get()
-        outstanding -= 1
-        request = completion.request
-        latency_ms = (completion.completed_at - completion.started_at) * 1000
-        if completion.error is None:
-            controller.record_request(
-                latency_ms, failed=False, coordinator=completion.coordinator
-            )
-            controller.complete_success_many(request["rows"])
             continue
 
-        controller.record_request(
-            latency_ms, failed=True, coordinator=completion.coordinator
-        )
-        if request["attempt"] < max_attempts and not controller.stop_event.is_set():
-            backoff = float(workload["retry_backoff_seconds"]) * (
-                2 ** (request["attempt"] - 1)
+        rate_delay = 0.0
+        if controller.rate_limit:
+            last_index = controller.next_index + rows_per_request - 1
+            if controller.total_rows:
+                last_index = min(
+                    last_index,
+                    controller.next_index
+                    + max(
+                        0,
+                        controller.total_rows
+                        - controller.succeeded
+                        - controller.in_flight,
+                    )
+                    - 1,
+                )
+            rate_delay = (
+                controller.started_at + last_index / controller.rate_limit - now
             )
-            controller.stop_event.wait(backoff)
-            if not controller.stop_event.is_set():
+        if (
+            not stopping
+            and outstanding + len(retries) < request_window
+            and rate_delay <= 0
+        ):
+            indexes = controller.claim_many(
+                rows_per_request, stay_within_group=(write_mode == "unlogged_batch")
+            )
+            if indexes:
+                if write_mode == "unlogged_batch":
+                    indexes = [
+                        generator.same_partition_index(i, workload["batch_size"])
+                        for i in indexes
+                    ]
+                rows = [generator.generate(i) for i in indexes]
+                values = [generator.bind_values(row) for row in rows]
                 _submit_async_request(
                     session,
                     prepared,
                     config,
-                    request["rows"],
-                    request["value_rows"],
-                    attempt=request["attempt"] + 1,
-                    controller=controller,
-                    completed_queue=completed_queue,
+                    rows,
+                    values,
+                    1,
+                    controller,
+                    completed_queue,
                 )
                 outstanding += 1
                 continue
-        controller.complete_failure_many(completion.error, len(request["rows"]))
+        timeout = 0.02
+        if rate_delay > 0:
+            timeout = min(timeout, rate_delay)
+        if retries:
+            timeout = min(timeout, max(0.0001, retries[0][0] - now))
+        try:
+            completion = completed_queue.get(timeout=timeout)
+        except queue_module.Empty:
+            pass
+
+
+def _retryable(error):
+    # Driver-independent names keep the stdlib-only self-test usable.
+    return type(error).__name__ in {
+        "OperationTimedOut",
+        "WriteTimeout",
+        "Unavailable",
+        "Overloaded",
+        "NoHostAvailable",
+        "SyntheticRetryable",
+    }
 
 
 def _worker_guard(
@@ -1561,7 +1778,9 @@ def _worker_guard(
                 all_workers_done.set()
 
 
-def _run_worker_specs(worker_specs, controller, config, show_progress):
+def _run_worker_specs(
+    worker_specs, controller, config, show_progress, progress_callback=None
+):
     progress_interval = float(config["workload"]["progress_interval_seconds"])
     worker_state = {"remaining": len(worker_specs), "errors": []}
     state_lock = threading.Lock()
@@ -1586,16 +1805,26 @@ def _run_worker_specs(worker_specs, controller, config, show_progress):
             threads.append(thread)
         next_progress = MONOTONIC_TIME() + progress_interval
         while not all_workers_done.is_set():
+            if (
+                controller.external_stop is not None
+                and controller.external_stop.is_set()
+            ):
+                controller.request_stop("interrupted")
             timeout = 0.5
             if progress_interval > 0:
                 timeout = max(0.05, min(0.5, next_progress - MONOTONIC_TIME()))
             all_workers_done.wait(timeout)
             if (
-                show_progress
+                (show_progress or progress_callback)
                 and progress_interval > 0
                 and MONOTONIC_TIME() >= next_progress
             ):
-                print_progress(controller.snapshot(), config)
+                snapshot = controller.snapshot()
+                if progress_callback:
+                    snapshot["_latency_samples"] = list(controller.latency_samples)
+                    progress_callback(snapshot)
+                if show_progress:
+                    print_progress(snapshot, config)
                 next_progress = MONOTONIC_TIME() + progress_interval
     except KeyboardInterrupt:
         print(
@@ -1613,9 +1842,21 @@ def _run_worker_specs(worker_specs, controller, config, show_progress):
         raise worker_state["errors"][0]
 
 
-def run_load(session, prepared, config, generator=None, show_progress=True):
+def run_load(
+    session,
+    prepared,
+    config,
+    generator=None,
+    show_progress=True,
+    progress_callback=None,
+    start_at=None,
+    external_stop=None,
+):
     generator = generator or VehicleRowGenerator(config)
     controller = LoadController(config)
+    if start_at is not None:
+        controller.started_at = start_at
+    controller.external_stop = external_stop
     workload = config["workload"]
     concurrency = workload["concurrency"]
     sessions = list(session) if isinstance(session, (list, tuple)) else [session]
@@ -1644,7 +1885,7 @@ def run_load(session, prepared, config, generator=None, show_progress=True):
                 (
                     _async_worker,
                     (
-                        sessions[producer_index % len(sessions)],
+                        sessions,
                         prepared,
                         config,
                         generator,
@@ -1653,8 +1894,11 @@ def run_load(session, prepared, config, generator=None, show_progress=True):
                     ),
                 )
             )
-    _run_worker_specs(worker_specs, controller, config, show_progress)
+    _run_worker_specs(
+        worker_specs, controller, config, show_progress, progress_callback
+    )
     summary = controller.snapshot()
+    summary["_latency_samples"] = list(controller.latency_samples)
     summary["write_mode"] = workload["write_mode"]
     summary["configured_concurrency"] = concurrency
     summary["sessions"] = len(sessions)
@@ -1714,6 +1958,10 @@ class _SelfTestFuture:
             errback(self.error)
 
 
+class SyntheticRetryable(RuntimeError):
+    pass
+
+
 class _SelfTestSession:
     def __init__(self, fail_first_async=False):
         self.lock = threading.Lock()
@@ -1731,13 +1979,54 @@ class _SelfTestSession:
         with self.lock:
             self.async_calls += 1
             if self.fail_first_async and self.async_calls == 1:
-                return _SelfTestFuture(RuntimeError("synthetic async failure"))
+                return _SelfTestFuture(SyntheticRetryable("synthetic async failure"))
             self.rows.append(values)
         return _SelfTestFuture()
 
 
 def run_self_test(config):
-    test_config = copy.deepcopy(config)
+    test_config = validate_config(
+        {
+            "connection": {},
+            "schema": {
+                "keyspace": "self_test",
+                "table": "vehicle",
+                "columns": [
+                    {"name": "vehicle_id", "generator": "vehicle_id"},
+                    {"name": "event_time_s", "generator": "event_time_seconds"},
+                    {"name": "timeline", "generator": "timeline"},
+                    {"name": "sample_seq", "generator": "sequence"},
+                    {"name": "time_window", "generator": "time_window"},
+                ],
+            },
+            "workload": {
+                "vehicle_count": 2,
+                "total_rows": 257,
+                "max_retries": 1,
+                "timelines": [
+                    {"name": name, "interval_seconds": 1}
+                    for name in ("gps", "powertrain", "battery")
+                ],
+                "time_windows": [
+                    {
+                        "name": "cold",
+                        "weight": 4,
+                        "start_offset_seconds": -604800,
+                        "end_offset_seconds": -86400,
+                    },
+                    {
+                        "name": "hot",
+                        "weight": 1,
+                        "start_offset_seconds": -300,
+                        "end_offset_seconds": 0,
+                    },
+                ],
+            },
+            "verification": {
+                "key_columns": ["vehicle_id", "event_time_s", "timeline", "sample_seq"]
+            },
+        }
+    )
     test_config["schema"]["create_keyspace_if_missing"] = False
     test_config["schema"]["create_table_if_missing"] = False
     test_config["schema"]["temperature_source"] = "custom_ck"
@@ -1863,7 +2152,7 @@ def prepare_insert(session, config):
         config["workload"]["consistency_level"]
     )
     if hasattr(statement, "is_idempotent"):
-        statement.is_idempotent = True
+        statement.is_idempotent = config["workload"]["ttl_seconds"] is None
     return statement
 
 
@@ -1890,21 +2179,56 @@ def run_verification(
     keys = verification["key_columns"]
     found = 0
     missing_keys = []
+    mismatches = []
     timeout = float(config["connection"]["request_timeout_seconds"])
     for row in sample_rows:
         values = tuple(row[name] for name in keys)
-        result = session.execute(statement, values, timeout=timeout).one()
+        result = next(iter(session.execute(statement, values, timeout=timeout)), None)
         if result is None:
             missing_keys.append({name: _json_value(row[name]) for name in keys})
         else:
             found += 1
+            actual = result if isinstance(result, dict) else result._asdict()
+            for column in config["schema"]["columns"]:
+                name = column["name"]
+                if not _values_equal(row.get(name), actual.get(name)):
+                    mismatches.append(
+                        {"column": name, "keys": {k: _json_value(row[k]) for k in keys}}
+                    )
     return {
         "enabled": True,
         "checked": len(sample_rows),
         "found": found,
         "missing": len(missing_keys),
         "missing_keys": missing_keys[:10],
+        "mismatched_values": len(mismatches),
+        "mismatch_samples": mismatches[:10],
     }
+
+
+def _values_equal(expected, actual):
+    if isinstance(expected, bytearray):
+        return actual is not None and bytearray(actual) == expected
+    if isinstance(expected, datetime) and isinstance(actual, datetime):
+        # CQL timestamp persists milliseconds, not Python's microseconds.
+        # Drivers return UTC-naive datetimes; normalize aware inputs to UTC.
+        if expected.utcoffset() is not None:
+            expected = expected - expected.utcoffset()
+        if actual.utcoffset() is not None:
+            actual = actual - actual.utcoffset()
+        expected = expected.replace(
+            tzinfo=None, microsecond=(expected.microsecond // 1000) * 1000
+        )
+        return expected == actual.replace(tzinfo=None)
+    if isinstance(expected, date) and not isinstance(expected, datetime):
+        # Python 2 date.__eq__ does not delegate to cassandra.util.Date.
+        to_date = getattr(actual, "date", None)
+        if callable(to_date):
+            actual = to_date()
+        return expected == actual
+    if isinstance(expected, float) and isinstance(actual, (int, float)):
+        return abs(expected - actual) <= max(1e-6, abs(expected) * 1e-6)
+    return expected == actual
 
 
 def _cqlsh_library_dirs(cassandra_home):
@@ -1942,7 +2266,12 @@ def _bundled_cqlsh_paths(cassandra_home):
         )
         if not driver_zips:
             continue
-        driver_zip = max(driver_zips)
+        driver_zip = max(
+            driver_zips,
+            key=lambda p: tuple(
+                int(n) for n in re.findall(r"\d+", os.path.basename(p))
+            ),
+        )
         filename = os.path.splitext(os.path.basename(driver_zip))[0]
         version = filename[len("cassandra-driver-internal-only-") :]
         paths = [os.path.join(driver_zip, "cassandra-driver-" + version)]
@@ -1974,7 +2303,7 @@ def _load_cassandra_driver(cassandra_home):
             "cassandra-driver version compatible with this Python and "
             "Cassandra release.".format(exc, search_text)
         )
-    source = paths[0] if paths else "existing Python import path"
+    source = getattr(cassandra, "__file__", "unknown")
     return (
         cassandra,
         PlainTextAuthProvider,
@@ -2006,12 +2335,21 @@ def connect(config):
         "port": connection["port"],
         "connect_timeout": float(connection["connect_timeout_seconds"]),
     }
+    from cassandra.policies import FallthroughRetryPolicy
+    from cassandra.metadata import murmur3
+
+    cluster_args["default_retry_policy"] = FallthroughRetryPolicy()
     if connection["protocol_version"] is not None:
         cluster_args["protocol_version"] = connection["protocol_version"]
-    if connection["local_dc"]:
-        cluster_args["load_balancing_policy"] = TokenAwarePolicy(
-            DCAwareRoundRobinPolicy(local_dc=connection["local_dc"])
+    policy = DCAwareRoundRobinPolicy(local_dc=connection["local_dc"])
+    if murmur3 is not None:
+        policy = TokenAwarePolicy(policy)
+    cluster_args["load_balancing_policy"] = policy
+    print(
+        ">>> routing={} murmur3={} pid={}".format(
+            type(policy).__name__, murmur3 is not None, os.getpid()
         )
+    )
     if connection["username_env"]:
         username = os.environ.get(connection["username_env"])
         password = os.environ.get(connection["password_env"])
@@ -2030,10 +2368,7 @@ def connect(config):
             )
         context = ssl.create_default_context(cafile=ssl_config["ca_cert"] or None)
         context.check_hostname = ssl_config["check_hostname"]
-        if not context.check_hostname:
-            context.verify_mode = (
-                ssl.CERT_REQUIRED if ssl_config["ca_cert"] else ssl.CERT_NONE
-            )
+        context.verify_mode = ssl.CERT_REQUIRED
         if ssl_config["client_cert"]:
             context.load_cert_chain(ssl_config["client_cert"], ssl_config["client_key"])
         cluster_args["ssl_context"] = context
@@ -2048,10 +2383,11 @@ def connect(config):
         cluster.shutdown()
         raise
     print(
-        ">>> Driver protocol_version={} sessions={} discovered_hosts={}".format(
+        ">>> Driver protocol_version={} sessions={} discovered_hosts={} reactor={}".format(
             getattr(cluster, "protocol_version", "unknown"),
             len(sessions),
             len(cluster.metadata.all_hosts()),
+            cluster.connection_class.__name__,
         )
     )
     sys.stdout.flush()
@@ -2064,6 +2400,101 @@ def run_schema_setup(session, config):
         session.execute(render_ddl(schema["keyspace_cql"], config))
     if schema["create_table_if_missing"]:
         session.execute(render_ddl(schema["table_cql"], config))
+
+
+def validate_live_schema(session, config):
+    schema = config["schema"]
+    metadata = session.cluster.metadata
+    table = metadata.keyspaces[schema["keyspace"]].tables[schema["table"]]
+    partition = [c.name for c in table.partition_key]
+    clustering = [c.name for c in table.clustering_key]
+    if partition != schema["partition_key_columns"]:
+        raise ConfigError(
+            "actual partition key {} differs from configured {}".format(
+                partition, schema["partition_key_columns"]
+            )
+        )
+    if set(config["verification"]["key_columns"]) != set(partition + clustering):
+        raise ConfigError(
+            "verification.key_columns must be the complete actual primary key"
+        )
+    for col in schema["columns"]:
+        if col["name"] not in table.columns:
+            raise ConfigError(
+                "column missing from actual table: {}".format(col["name"])
+            )
+    if (
+        schema["temperature_source"] == "custom_ck"
+        and schema["temperature_column"] not in clustering
+    ):
+        raise ConfigError("temperature_column is not an actual clustering column")
+    # Vendor metadata is not standardized. Unknown must be explicit, not reported as verified.
+    raw = next(
+        iter(
+            session.execute(
+                "SELECT * FROM system_schema.tables WHERE keyspace_name=%s AND table_name=%s",
+                (schema["keyspace"], schema["table"]),
+            )
+        ),
+        None,
+    )
+    attributes = raw._asdict() if raw is not None else {}
+    chs = (
+        attributes.get("z06_chs")
+        or attributes.get("Z06_CHS")
+        or table.options.get("Z06_CHS")
+    )
+    chs_status = "not_exposed"
+    if isinstance(chs, dict):
+        match = re.search(
+            r"Z06_CHS\s*=\s*\{([^}]*)\}", schema["table_cql"], re.IGNORECASE
+        )
+        desired = (
+            dict(
+                re.findall(
+                    r"['\"]([a-z_]+)['\"]\s*:\s*['\"]([^'\"]+)['\"]", match.group(1)
+                )
+            )
+            if match
+            else {}
+        )
+        for name, value in desired.items():
+            if str(chs.get(name)) != value:
+                raise ConfigError(
+                    "actual CHS {}={!r} differs from {!r}".format(
+                        name, chs.get(name), value
+                    )
+                )
+        actual_column = chs.get("chs_column", "")
+        expected_column = schema["temperature_column"]
+        if actual_column != expected_column:
+            raise ConfigError(
+                "actual chs_column {!r} differs from {!r}".format(
+                    actual_column, expected_column
+                )
+            )
+        generator = {c["name"]: c["generator"] for c in schema["columns"]}.get(
+            expected_column
+        )
+        expected_unit = {"event_time_seconds": "s", "event_time_millis": "ms"}.get(
+            generator
+        )
+        if expected_unit and chs.get("time_unit") != expected_unit:
+            raise ConfigError("CHS time_unit does not match temperature generator")
+        chs_status = "verified"
+    elif schema["require_chs_metadata"]:
+        raise ConfigError(
+            "CHS metadata not exposed; cannot verify temperature settings"
+        )
+    result = {
+        "partition_key": partition,
+        "clustering_key": clustering,
+        "replication": str(metadata.keyspaces[schema["keyspace"]].replication_strategy),
+        "chs_metadata": chs_status,
+    }
+    print(">>> schema_preflight " + json.dumps(result, sort_keys=True))
+    sys.stdout.flush()
+    return result
 
 
 def run_optional_truncate(session, config, allow_destructive):
@@ -2118,6 +2549,12 @@ def config_summary(config):
         "write_mode": workload["write_mode"],
         "concurrency": workload["concurrency"],
         "producer_threads": workload["producer_threads"],
+        "processes": workload["processes"],
+        "run_id": workload["run_id"],
+        "version": VERSION,
+        "max_batch_bytes": workload["max_batch_bytes"],
+        "window_anchor": workload["window_anchor"],
+        "window_sampling": workload["window_sampling"],
         "batch_size": workload["batch_size"],
         "total_rows": workload["total_rows"],
         "duration_seconds": workload["duration_seconds"],
@@ -2170,6 +2607,384 @@ def write_summary(path_text, summary):
     replace_file(temporary, path)
 
 
+def _database_setup(config, allow_destructive, output):
+    cluster = None
+    try:
+        cluster, sessions = connect(config)
+        session = sessions[0]
+        run_schema_setup(session, config)
+        session.cluster.refresh_schema_metadata()
+        prepare_insert(session, config)
+        prepare_verification(session, config)
+        schema = validate_live_schema(session, config)
+        run_optional_truncate(session, config, allow_destructive)
+        output.put(("setup", -1, schema))
+    except Exception as exc:
+        output.put(("error", -1, "{}: {}".format(type(exc).__name__, exc)))
+    finally:
+        if cluster is not None:
+            cluster.shutdown()
+
+
+def _load_process(
+    worker_id, config, vehicle_offset, start, start_event, stop_event, output
+):
+    cluster = None
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+        cluster, sessions = connect(config)
+        prepared = prepare_insert(sessions[0], config)
+        verifier = prepare_verification(sessions[0], config)
+        generator = VehicleRowGenerator(config, vehicle_offset=vehicle_offset)
+        output.put(("ready", worker_id, {"pid": os.getpid()}))
+        while not start_event.wait(0.1):
+            if stop_event.is_set():
+                return
+        if stop_event.is_set():
+            return
+
+        # Send numeric stats only; never IPC individual generated rows.
+        def report(snapshot):
+            output.put(("progress", worker_id, snapshot))
+
+        summary, samples = run_load(
+            sessions,
+            prepared,
+            config,
+            generator=generator,
+            show_progress=False,
+            progress_callback=report,
+            start_at=start.value,
+            external_stop=stop_event,
+        )
+        if summary["failed_rows"]:
+            stop_event.set()
+        output.put(("progress", worker_id, summary))
+        verification = run_verification(
+            sessions[0], config, samples, statement=verifier
+        )
+        output.put(
+            (
+                "done",
+                worker_id,
+                {"load": summary, "verification": verification, "pid": os.getpid()},
+            )
+        )
+    except Exception as exc:
+        stop_event.set()
+        output.put(("error", worker_id, "{}: {}".format(type(exc).__name__, exc)))
+    finally:
+        if cluster is not None:
+            cluster.shutdown()
+
+
+def _aggregate_snapshots(snapshots, elapsed):
+    elapsed = max(elapsed, 1e-9)
+    fields = (
+        "claimed_rows",
+        "in_flight",
+        "succeeded_rows",
+        "failed_rows",
+        "request_attempts",
+        "request_errors",
+        "requests_in_flight",
+        "completion_queued",
+        "retry_attempts",
+        "encoded_bytes",
+    )
+    result = {name: sum(s.get(name, 0) for s in snapshots) for name in fields}
+    result["elapsed_seconds"] = elapsed
+    result["rows_per_second"] = result["succeeded_rows"] / elapsed
+    result["requests_per_second"] = result["request_attempts"] / elapsed
+    result["client_cpu_percent"] = (
+        sum(s.get("client_cpu_percent", 0) * s["elapsed_seconds"] for s in snapshots)
+        / elapsed
+    )
+    hosts = {}
+    weighted_samples = []
+    latency_total = 0.0
+    queue_total = 0.0
+    for snapshot in snapshots:
+        for host, count in snapshot.get("coordinator_requests", {}).items():
+            hosts[host] = hosts.get(host, 0) + count
+        n = snapshot["request_attempts"]
+        samples = snapshot.get("_latency_samples", [])
+        weight = n / float(max(1, len(samples)))
+        weighted_samples.extend((v, weight) for v in samples)
+        latency_total += snapshot["latency_ms"]["mean"] * n
+        queue_total += snapshot.get("queue_delay_ms_mean", 0) * n
+    weighted_samples.sort()
+    latency = {
+        "sample_count": len(weighted_samples),
+        "mean": latency_total / max(1, result["request_attempts"]),
+        "max": max([s["latency_ms"]["max"] for s in snapshots] or [0]),
+    }
+    for name, fraction in (("p50", 0.5), ("p95", 0.95), ("p99", 0.99)):
+        threshold = sum(w for _, w in weighted_samples) * fraction
+        accumulated = 0.0
+        latency[name] = 0.0
+        for value, weight in weighted_samples:
+            accumulated += weight
+            if accumulated >= threshold:
+                latency[name] = round(value, 3)
+                break
+    result["latency_ms"] = latency
+    result["queue_delay_ms_mean"] = queue_total / max(1, result["request_attempts"])
+    result["coordinator_requests"] = hosts
+    result["errors"] = [e for s in snapshots for e in s.get("errors", [])][:10]
+    return result
+
+
+def _interval_progress(summary, previous, config):
+    span = summary["elapsed_seconds"] - (previous["elapsed_seconds"] if previous else 0)
+    span = max(span, 1e-9)
+    rows = summary["succeeded_rows"] - (previous["succeeded_rows"] if previous else 0)
+    req = summary["request_attempts"] - (
+        previous["request_attempts"] if previous else 0
+    )
+    encoded = summary["encoded_bytes"] - (previous["encoded_bytes"] if previous else 0)
+    print(
+        ">>> progress utc={} elapsed={:.1f}s rows={} failed={} row_rate={:.1f}/s avg_row_rate={:.1f}/s "
+        "req_rate={:.1f}/s driver_pending={} completed_queued={} retry_attempts={} request_errors={} "
+        "p95_all={:.3f}ms callback_queue_mean={:.3f}ms client_cpu_avg={:.1f}% encoded_MBps={:.3f} coordinators={}".format(
+            _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            summary["elapsed_seconds"],
+            summary["succeeded_rows"],
+            summary["failed_rows"],
+            rows / span,
+            summary["rows_per_second"],
+            req / span,
+            summary["requests_in_flight"],
+            summary["completion_queued"],
+            summary["retry_attempts"],
+            summary["request_errors"],
+            summary["latency_ms"]["p95"],
+            summary["queue_delay_ms_mean"],
+            summary["client_cpu_percent"],
+            encoded / span / 1000000,
+            json.dumps(summary["coordinator_requests"], sort_keys=True),
+        )
+    )
+    sys.stdout.flush()
+
+
+def run_distributed(config, allow_destructive=False):
+    # Parent never creates/imports a live driver Cluster. Py2 fork and Py3 spawn are both safe here.
+    context = (
+        multiprocessing.get_context("spawn")
+        if hasattr(multiprocessing, "get_context")
+        else multiprocessing
+    )
+    output = context.Queue()
+    stop = context.Event()
+    go = context.Event()
+    start = context.Value("d", 0.0)
+    processes = []
+    old_signals = {}
+    interrupted = [False]
+
+    def on_signal(*_):
+        interrupted[0] = True
+        stop.set()
+        go.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        old_signals[sig] = signal.signal(sig, on_signal)
+    workload = config["workload"]
+    try:
+        setup = context.Process(
+            target=_database_setup, args=(config, allow_destructive, output)
+        )
+        setup.start()
+        processes.append(setup)
+        timeout = max(60, config["connection"]["request_timeout_seconds"] * 3)
+        kind, _, schema = output.get(timeout=timeout)
+        setup.join(timeout)
+        if kind != "setup" or setup.exitcode != 0:
+            raise RuntimeError("database setup failed: {}".format(schema))
+        count = min(
+            workload["processes"], workload["concurrency"], workload["vehicle_count"]
+        )
+        if workload["total_rows"]:
+            count = min(count, workload["total_rows"])
+        run_id = workload["run_id"]
+        if run_id == "auto":
+            run_id = uuid.uuid4().hex[:12]
+        offset = 0
+        children = []
+        for index in ITER_RANGE(count):
+            child = copy.deepcopy(config)
+            w = child["workload"]
+            w["concurrency"] = workload["concurrency"] // count + (
+                index < workload["concurrency"] % count
+            )
+            w["producer_threads"] = min(w["producer_threads"], w["concurrency"])
+            w["vehicle_count"] = workload["vehicle_count"] // count + (
+                index < workload["vehicle_count"] % count
+            )
+            w["total_rows"] = workload["total_rows"] // count + (
+                index < workload["total_rows"] % count
+            )
+            w["rate_limit_rows_per_second"] = workload[
+                "rate_limit_rows_per_second"
+            ] / float(count)
+            w["progress_interval_seconds"] = min(
+                workload["progress_interval_seconds"] or 1, 1
+            )
+            child["verification"]["sample_size"] = config["verification"][
+                "sample_size"
+            ] // count + (index < config["verification"]["sample_size"] % count)
+            if run_id:
+                w["vehicle_id_prefix"] = workload["vehicle_id_prefix"] + run_id + "-"
+            process = context.Process(
+                target=_load_process,
+                args=(index, child, offset, start, go, stop, output),
+            )
+            offset += w["vehicle_count"]
+            process.start()
+            children.append(process)
+            processes.append(process)
+        ready = set()
+        ready_deadline = MONOTONIC_TIME() + timeout
+        while len(ready) < count:
+            if stop.is_set() or MONOTONIC_TIME() > ready_deadline:
+                raise RuntimeError("workers did not become ready")
+            try:
+                kind, index, message = output.get(timeout=0.2)
+            except queue_module.Empty:
+                if any(p.exitcode is not None for p in children):
+                    raise RuntimeError("worker exited during startup")
+                continue
+            if kind == "error":
+                raise RuntimeError("worker {}: {}".format(index, message))
+            if kind == "ready":
+                ready.add(index)
+        print(
+            ">>> Loading {} version={} processes={} producers_per_process={} global_concurrency={} batch={} run_id={!r}".format(
+                qualified_table(config),
+                VERSION,
+                count,
+                workload["producer_threads"],
+                workload["concurrency"],
+                workload["batch_size"]
+                if workload["write_mode"] == "unlogged_batch"
+                else 1,
+                run_id,
+            )
+        )
+        sys.stdout.flush()
+        start.value = MONOTONIC_TIME()
+        go.set()
+        latest = {}
+        done = {}
+        previous = None
+        interval = workload["progress_interval_seconds"]
+        next_report = start.value + (interval or 1e100)
+        stop_at = None
+        while len(done) < count:
+            now = MONOTONIC_TIME()
+            if stop.is_set() and stop_at is None:
+                stop_at = now
+            if (
+                stop_at is not None
+                and now - stop_at > workload["drain_timeout_seconds"] + 5
+            ):
+                raise RuntimeError(
+                    "worker shutdown exceeded deadline; writes may have unknown outcome"
+                )
+            try:
+                kind, index, message = output.get(timeout=0.2)
+            except queue_module.Empty:
+                for index, process in enumerate(children):
+                    if process.exitcode is not None and index not in done:
+                        raise RuntimeError(
+                            "worker {} exited without final report ({})".format(
+                                index, process.exitcode
+                            )
+                        )
+                continue
+            if kind == "error":
+                raise RuntimeError("worker {}: {}".format(index, message))
+            if kind == "progress":
+                latest[index] = message
+            elif kind == "done":
+                done[index] = message
+                latest[index] = message["load"]
+            if MONOTONIC_TIME() >= next_report and latest:
+                summary = _aggregate_snapshots(
+                    list(latest.values()), MONOTONIC_TIME() - start.value
+                )
+                _interval_progress(summary, previous, config)
+                previous = summary
+                next_report = MONOTONIC_TIME() + interval
+        elapsed = max(s["elapsed_seconds"] for s in latest.values())
+        summary = _aggregate_snapshots(list(latest.values()), elapsed)
+        summary.update(
+            processes=count,
+            configured_concurrency=workload["concurrency"],
+            write_mode=workload["write_mode"],
+            batch_size=workload["batch_size"]
+            if workload["write_mode"] == "unlogged_batch"
+            else 1,
+            stop_reason="interrupted"
+            if interrupted[0]
+            else (
+                "rows"
+                if workload["total_rows"]
+                and summary["succeeded_rows"] >= workload["total_rows"]
+                else "duration"
+            ),
+        )
+        for item in done.values():
+            item["load"].pop("_latency_samples", None)
+        verification = {
+            name: sum(item["verification"].get(name, 0) for item in done.values())
+            for name in ("checked", "found", "missing", "mismatched_values")
+        }
+        verification["enabled"] = config["verification"]["enabled"]
+        status = "PASS"
+        if (
+            summary["failed_rows"]
+            or verification["missing"]
+            or verification["mismatched_values"]
+        ):
+            status = "FAIL"
+            summary["stop_reason"] = "error"
+        if interrupted[0]:
+            status = "INTERRUPTED"
+        for process in children:
+            process.join(timeout)
+            if process.exitcode != 0:
+                raise RuntimeError("worker did not exit cleanly")
+        return {
+            "status": status,
+            "version": VERSION,
+            "run_id": run_id,
+            "target": qualified_table(config),
+            "temperature_source": config["schema"]["temperature_source"],
+            "event_time_mode": workload["event_time_mode"],
+            "schema": schema,
+            "load": summary,
+            "verification": verification,
+            "workers": [done[i] for i in sorted(done)],
+            "finished_at_utc": _utc_now().isoformat(),
+        }
+    finally:
+        stop.set()
+        go.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+                if process.is_alive():
+                    os.kill(process.pid, signal.SIGKILL)
+                    process.join(2)
+        for sig, handler in old_signals.items():
+            signal.signal(sig, handler)
+        output.close()
+
+
 def parse_count(value):
     match = _fullmatch(r"\s*(\d+)\s*([kKmMbB]?)\s*", value)
     if not match:
@@ -2198,6 +3013,15 @@ def build_argument_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", required=True, help="JSON configuration path")
+    parser.add_argument(
+        "--processes",
+        type=int,
+        help="independent writer processes; concurrency/rate/rows stay global",
+    )
+    parser.add_argument(
+        "--run-id",
+        help="auto (default), explicit run identity, or empty for intentional replay",
+    )
     parser.add_argument(
         "--cassandra-home",
         help="reuse the bundled driver from CASSANDRA_HOME/lib, like cqlsh.py",
@@ -2280,7 +3104,10 @@ def main(argv=None):
     parser = build_argument_parser()
     args = parser.parse_args(argv)
     try:
-        config = validate_config(load_json_config(args.config))
+        config = load_json_config(args.config)
+        # Normalize only after overrides, so valid CLI overrides can repair incomplete settings.
+        for name in ("connection", "workload", "report"):
+            config.setdefault(name, {})
         config = apply_overrides(config, args)
         if args.concurrency is not None and args.concurrency < 1:
             raise ConfigError("--concurrency must be >= 1")
@@ -2325,52 +3152,10 @@ def main(argv=None):
         )
         return EXIT_CONFIG_OR_ENV
 
-    cluster = None
     try:
-        print(
-            ">>> Connecting to "
-            + ",".join(config["connection"]["contact_points"])
-            + ":{}".format(config["connection"]["port"])
-        )
-        sys.stdout.flush()
-        cluster, sessions = connect(config)
-        session = sessions[0]
-        run_schema_setup(session, config)
-        prepared = prepare_insert(session, config)
-        verification_prepared = prepare_verification(session, config)
-        run_optional_truncate(session, config, args.allow_destructive)
-        print(
-            ">>> Loading {} mode={} concurrency={} producers={} batch={} "
-            "temperature_source={} event_time_mode={}".format(
-                qualified_table(config),
-                config["workload"]["write_mode"],
-                config["workload"]["concurrency"],
-                config["workload"]["producer_threads"],
-                (
-                    config["workload"]["batch_size"]
-                    if config["workload"]["write_mode"] == "unlogged_batch"
-                    else 1
-                ),
-                config["schema"]["temperature_source"],
-                config["workload"]["event_time_mode"],
-            )
-        )
-        sys.stdout.flush()
-        load_summary, sample_rows = run_load(sessions, prepared, config)
-        verification = run_verification(
-            session, config, sample_rows, statement=verification_prepared
-        )
-        final_summary = {
-            "status": "PASS",
-            "target": qualified_table(config),
-            "temperature_source": config["schema"]["temperature_source"],
-            "event_time_mode": config["workload"]["event_time_mode"],
-            "load": load_summary,
-            "verification": verification,
-            "finished_at_utc": _utc_now().isoformat(),
-        }
-        if load_summary["failed_rows"] > 0 or verification.get("missing", 0) > 0:
-            final_summary["status"] = "FAIL"
+        final_summary = run_distributed(config, args.allow_destructive)
+        load_summary = final_summary["load"]
+        verification = final_summary["verification"]
         write_summary(config["report"]["summary_json"], final_summary)
         print(json.dumps(final_summary, ensure_ascii=True, indent=2))
         sys.stdout.flush()
@@ -2383,19 +3168,36 @@ def main(argv=None):
                 )
             )
             return EXIT_OK
+        if final_summary["status"] == "INTERRUPTED":
+            return EXIT_INTERRUPTED
         print("FAIL: load or read-back verification reported errors", file=sys.stderr)
         return EXIT_LOAD_FAILED
     except KeyboardInterrupt:
         return EXIT_INTERRUPTED
     except (ConfigError, RuntimeError) as exc:
+        write_summary(
+            config["report"]["summary_json"],
+            {
+                "status": "FAIL",
+                "version": VERSION,
+                "error": str(exc),
+                "writes_may_have_unknown_outcome": True,
+            },
+        )
         print("ERROR: {}".format(exc), file=sys.stderr)
         return EXIT_CONFIG_OR_ENV
     except Exception as exc:  # noqa: BLE001 - convert all top-level failures to exit codes.
+        write_summary(
+            config["report"]["summary_json"],
+            {
+                "status": "FAIL",
+                "version": VERSION,
+                "error": "{}: {}".format(type(exc).__name__, exc),
+                "writes_may_have_unknown_outcome": True,
+            },
+        )
         print("FAIL: {}: {}".format(type(exc).__name__, exc), file=sys.stderr)
         return EXIT_LOAD_FAILED
-    finally:
-        if cluster is not None:
-            cluster.shutdown()
 
 
 if __name__ == "__main__":
